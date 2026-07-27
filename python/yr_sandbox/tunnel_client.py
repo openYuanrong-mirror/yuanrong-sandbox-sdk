@@ -17,8 +17,10 @@ Architecture:
 """
 
 import asyncio
+import http.cookiejar
 import logging
 import os
+import ssl
 import threading
 import time
 from typing import Optional
@@ -32,6 +34,74 @@ logger = logging.getLogger(__name__)
 _RECONNECT_DELAY = 1.0
 _COMPLETED_FRAME_TTL = 300.0
 _COMPLETED_FRAME_LIMIT = 1024
+_HOP_BY_HOP_HEADERS = frozenset(
+    {
+        "connection",
+        "keep-alive",
+        "proxy-authenticate",
+        "proxy-authorization",
+        "proxy-connection",
+        "te",
+        "trailer",
+        "transfer-encoding",
+        "upgrade",
+    }
+)
+
+
+def _headers_for_rebuilt_request(headers):
+    """Return ordered second-hop headers from the tunnel pair-list."""
+    pairs = []
+    for item in headers or []:
+        if not isinstance(item, (list, tuple)) or len(item) != 2:
+            raise ValueError("tunnel headers must be [name, value] pairs")
+        name, value = item
+        if not isinstance(name, str) or not isinstance(value, str):
+            raise TypeError("tunnel header names and values must be strings")
+        pairs.append((name, value))
+
+    connection_tokens = {
+        token.strip().lower()
+        for name, value in pairs
+        if name.lower() == "connection"
+        for token in value.split(",")
+        if token.strip()
+    }
+    excluded = (
+        _HOP_BY_HOP_HEADERS
+        | connection_tokens
+        | {
+            "host",
+            "content-length",
+            "expect",
+        }
+    )
+    return [(name, value) for name, value in pairs if name.lower() not in excluded]
+
+
+class _NoCookieJar(http.cookiejar.CookieJar):
+    """Keep pooled tunnel requests free of ambient HTTP cookie state."""
+
+    def extract_cookies(self, _response, _request):
+        return
+
+    def add_cookie_header(self, _request):
+        return
+
+
+def _ssl_context_for_tunnel(tunnel_ws_url):
+    if not tunnel_ws_url.startswith("wss://"):
+        return None
+    ca_bundle = os.environ.get("YR_TUNNEL_CA_BUNDLE") or None
+    context = ssl.create_default_context(cafile=ca_bundle)
+    verify = os.environ.get("YR_TUNNEL_SSL_VERIFY", "1").strip().lower()
+    if verify in ("0", "false", "no"):
+        logger.warning(
+            "TunnelClient TLS certificate verification is explicitly disabled"
+        )
+        context.check_hostname = False
+        context.verify_mode = ssl.CERT_NONE
+    return context
 
 
 class TunnelClient:
@@ -81,7 +151,11 @@ class TunnelClient:
                 pass
         if self._thread is not None and self._thread.is_alive():
             self._thread.join(timeout=5)
-        if self._thread is not None and self._thread.is_alive() and self._loop is not None:
+        if (
+            self._thread is not None
+            and self._thread.is_alive()
+            and self._loop is not None
+        ):
             # Last-resort fallback for a wedged event loop. The normal path
             # closes the WebSocket above, letting _connect_loop exit cleanly.
             self._loop.call_soon_threadsafe(self._loop.stop)
@@ -112,11 +186,6 @@ class TunnelClient:
         failures = 0
         while not self._stopping.is_set():
             try:
-                import ssl as _ssl
-
-                _ctx = _ssl.create_default_context()
-                _ctx.check_hostname = False
-                _ctx.verify_mode = _ssl.CERT_NONE
                 _extra_headers = {}
                 connect_url = tunnel_ws_url
                 if self._token:
@@ -125,19 +194,17 @@ class TunnelClient:
                     # Operators that sit behind a gateway known to drop custom
                     # WebSocket headers can explicitly enable the query-token
                     # fallback.
-                    token_query_fallback = os.environ.get(
-                        "YR_TUNNEL_TOKEN_QUERY_FALLBACK", "0"
-                    ).strip().lower()
+                    token_query_fallback = (
+                        os.environ.get("YR_TUNNEL_TOKEN_QUERY_FALLBACK", "0")
+                        .strip()
+                        .lower()
+                    )
                     if token_query_fallback in ("1", "true", "yes"):
                         sep = "&" if "?" in connect_url else "?"
                         connect_url = (
                             f"{connect_url}{sep}token={quote(self._token, safe='')}"
                         )
-                _ssl_ctx = None
-                if tunnel_ws_url.startswith("wss://"):
-                    _ssl_ctx = _ssl.create_default_context()
-                    _ssl_ctx.check_hostname = False
-                    _ssl_ctx.verify_mode = _ssl.CERT_NONE
+                _ssl_ctx = _ssl_context_for_tunnel(tunnel_ws_url)
                 async with ws_client.connect(
                     connect_url,
                     max_size=2**23,
@@ -216,26 +283,30 @@ class TunnelClient:
             rid = frame.get("id", "")
             method = frame.get("method", "GET")
             path = frame.get("path", "/")
-            req_headers = {
-                k: v
-                for k, v in (frame.get("headers") or {}).items()
-                if k.lower() not in ("host", "content-length", "connection")
-            }
             try:
+                req_headers = _headers_for_rebuilt_request(frame.get("headers") or [])
                 body_b64 = frame.get("body") or ""
                 body = base64.b64decode(body_b64) if body_b64 else b""
-                resp = await client.request(
+                async with client.stream(
                     method,
                     f"http://{self._upstream}{path}",
                     headers=req_headers or None,
-                    content=body or None,
-                )
+                    content=body,
+                ) as resp:
+                    raw_body = b"".join([chunk async for chunk in resp.aiter_raw()])
+                    response_headers = [
+                        (
+                            name.decode("ascii"),
+                            value.decode("latin-1"),
+                        )
+                        for name, value in resp.headers.raw
+                    ]
                 return {
                     "type": "http_resp",
                     "id": rid,
                     "status": resp.status_code,
-                    "headers": dict(resp.headers),
-                    "body": base64.b64encode(resp.content).decode("ascii"),
+                    "headers": response_headers,
+                    "body": base64.b64encode(raw_body).decode("ascii"),
                 }
             except Exception as e:  # upstream unreachable / fetch error
                 logger.debug("tunnel http_req upstream error: %s", e)
@@ -277,6 +348,7 @@ class TunnelClient:
                 limits=limits,
                 timeout=httpx.Timeout(60.0),
                 trust_env=False,
+                cookies=_NoCookieJar(),
             ) as client:
                 async for message in ws:
                     if self._stopping.is_set():
@@ -303,7 +375,7 @@ class TunnelClient:
                                 "timestamp": frame.get("timestamp", 0),
                             }
                         )
-                    # ws_connect/ws_message/ws_close: reverse WS tunneling is not
-                    # exercised by any sandbox example; ignore to keep the loop alive.
+                    # RRT rejects reverse WebSocket upgrades until both peers
+                    # implement that protocol.
         except ws_exc.ConnectionClosed:
             pass
