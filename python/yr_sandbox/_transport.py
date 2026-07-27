@@ -34,6 +34,13 @@ class SandboxError(RuntimeError):
     """Raised when the frontend returns a non-2xx response or an error body."""
 
 
+_SAFE_DIRECT_FALLBACK_ERRORS = (
+    httpx.ConnectError,
+    httpx.ConnectTimeout,
+    httpx.PoolTimeout,
+)
+
+
 def _require_env(name: str) -> str:
     value = os.environ.get(name, "").strip()
     if not value:
@@ -66,6 +73,7 @@ class SandboxClient:
             "no",
         )
         scheme = "https" if self._tls else "http"
+        self._origin = f"{scheme}://{self._server}"
         self._base = f"{scheme}://{self._server}/api/sandbox/v1"
         # TLS verification is controlled by the caller. timeout=None lets each
         # request pass an explicit timeout so long-running invokes are not cut
@@ -110,6 +118,25 @@ class SandboxClient:
             raise SandboxError(f"create response missing sandboxId: {data}")
         return sid
 
+    def resources(self) -> Dict[str, Any]:
+        """Query the existing global-scheduler JSON resource endpoint."""
+        resp = self._http.get(
+            f"{self._origin}/global-scheduler/resources",
+            headers={"Type": "json", "Accept": "application/json"},
+            timeout=60,
+        )
+        if resp.status_code >= 400:
+            raise SandboxError(
+                f"resource query failed: HTTP {resp.status_code} {resp.text}"
+            )
+        try:
+            payload = resp.json()
+        except ValueError as exc:
+            raise SandboxError("resource query returned invalid JSON") from exc
+        if not isinstance(payload, dict):
+            raise SandboxError("resource query returned an invalid response")
+        return payload
+
     def create_info(self, body: Dict[str, Any]) -> Dict[str, Any]:
         """POST /sandboxes and return the confirmed-running final SSE result."""
         logical_timeout = int(body.get("createTimeoutSeconds") or 60)
@@ -133,7 +160,7 @@ class SandboxClient:
                 raise SandboxError(f"HTTP {resp.status_code}: {resp.text}")
 
             event = ""
-            data_lines = []
+            data_lines: list[str] = []
             for line in resp.iter_lines():
                 if line == "":
                     if event == "final" and data_lines:
@@ -186,6 +213,33 @@ class SandboxClient:
                 f"delete {sandbox_id} failed: HTTP {resp.status_code} {resp.text}"
             )
 
+    def instance_info(self, sandbox_id: str) -> Dict[str, Any]:
+        """Return one instance summary from the existing frontend watcher API."""
+        resp = self._http.get(
+            f"{self._origin}/api/instances",
+            params={"instance_id": sandbox_id},
+            timeout=60,
+        )
+        if resp.status_code >= 400:
+            raise SandboxError(
+                f"get instance {sandbox_id} failed: "
+                f"HTTP {resp.status_code} {resp.text}"
+            )
+        try:
+            payload = resp.json()
+        except ValueError as exc:
+            raise SandboxError(
+                f"get instance {sandbox_id} returned invalid JSON"
+            ) from exc
+        if not isinstance(payload, list):
+            raise SandboxError(
+                f"get instance {sandbox_id} returned an invalid response"
+            )
+        for item in payload:
+            if isinstance(item, dict) and item.get("id") == sandbox_id:
+                return item
+        raise SandboxError(f"sandbox {sandbox_id} was not found")
+
     # ── unified action invoke ──────────────────────────────────────────
 
     def invoke(
@@ -210,18 +264,29 @@ class SandboxClient:
         else:
             rpc_timeout = max(timeout + YR_GET_TIMEOUT_BUFFER, YR_GET_DEFAULT_TIMEOUT)
 
+        request_id = self._new_request_id("invoke")
+
         # Prefer frontend /direct; fall back to frontend invoke.
         if self._direct_enabled and not self._direct_disabled:
             result, fell_back = self._invoke_direct(
-                sandbox_id, action, args or {}, rpc_timeout
+                sandbox_id,
+                action,
+                args or {},
+                rpc_timeout,
+                request_id,
             )
             if not fell_back:
                 return result
 
         resp = self._http.post(
             f"{self._base}/sandboxes/{sandbox_id}/invoke",
-            json={"action": action, "args": args or {}},
+            json={
+                "action": action,
+                "args": args or {},
+                "requestId": request_id,
+            },
             timeout=rpc_timeout,
+            headers={"X-YR-Request-ID": request_id},
         )
         return self._json(resp)
 
@@ -231,41 +296,58 @@ class SandboxClient:
         action: str,
         args: Dict[str, Any],
         rpc_timeout: Optional[float],
+        request_id: str,
     ) -> "tuple[Dict[str, Any], bool]":
         """Try the frontend /direct path. Returns ``(result, fell_back)``.
 
-        ``fell_back=True`` tells the caller to retry via frontend invoke. A
-        transport-level failure (direct route unreachable) also flips the
-        sticky ``_direct_disabled`` so we stop probing a dead direct route for
-        this client.
+        ``fell_back=True`` is returned only when the request is known not to
+        have reached RRT (connect/pool failure) or when frontend reports that
+        the direct route does not exist. Failures after request transmission
+        have an unknown execution outcome and must not retry side effects.
         Unlike frontend invoke, the RRT HTTP server returns the raw result JSON
         (no base64 ``BuildJobResponse`` envelope); action-level errors live
-        inside that object (HTTP 200), so only HTTP-level failures fall back.
+        inside that object (HTTP 200).
         """
         url = f"{self._direct_base}/{self._safe_id(sandbox_id)}/invoke"
         try:
-            request_id = self._new_request_id("invoke")
             resp = self._http.post(
                 url,
                 json={"action": action, "args": args, "requestId": request_id},
                 timeout=rpc_timeout,
                 headers={"X-YR-Request-ID": request_id},
             )
-        except httpx.RequestError:
-            # Direct route unreachable/timed out: disable direct and fall back.
+        except _SAFE_DIRECT_FALLBACK_ERRORS:
+            # No connection was established and no request bytes reached RRT.
             self._direct_disabled = True
             return {}, True
-        # 404 (route not ready) and 5xx (router/RRT down) → disable + fall back.
-        # 401/403/400 → fall back this call but keep probing (may be per-call).
-        if resp.status_code == 404 or resp.status_code >= 500:
+        except httpx.RequestError as exc:
+            self._direct_disabled = True
+            raise SandboxError(
+                "direct invoke outcome is unknown after transport failure "
+                f"(requestId={request_id}): {exc}"
+            ) from exc
+        if resp.status_code == 404:
             self._direct_disabled = True
             return {}, True
+        if resp.status_code >= 500:
+            self._direct_disabled = True
+            raise SandboxError(
+                "direct invoke outcome is unknown after "
+                f"HTTP {resp.status_code} (requestId={request_id}): {resp.text}"
+            )
         if resp.status_code >= 400:
-            return {}, True
+            raise SandboxError(
+                f"direct invoke failed: HTTP {resp.status_code} "
+                f"(requestId={request_id}): {resp.text}"
+            )
         try:
             parsed = resp.json()
-        except ValueError:
-            return {}, True
+        except ValueError as exc:
+            self._direct_disabled = True
+            raise SandboxError(
+                "direct invoke returned invalid JSON; outcome is unknown "
+                f"(requestId={request_id})"
+            ) from exc
         if not isinstance(parsed, dict):
             parsed = {"value": parsed}
         return parsed, False

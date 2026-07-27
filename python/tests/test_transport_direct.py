@@ -8,8 +8,8 @@ disable. Run: ``python tests/test_transport_direct.py`` (or via pytest).
 
 import base64
 import hashlib
-import inspect
 import importlib.util
+import inspect
 import io
 import json
 import os
@@ -23,8 +23,8 @@ import httpx
 os.environ.setdefault("YR_SERVER_ADDRESS", "frontend:8889")
 os.environ.setdefault("YR_TOKEN", "test-token")
 
-from yr_sandbox.filesystem import Filesystem  # noqa: E402
 from yr_sandbox._transport import SandboxClient, SandboxError  # noqa: E402
+from yr_sandbox.filesystem import Filesystem  # noqa: E402
 
 
 def _check(cond: bool, msg: str) -> None:
@@ -142,10 +142,17 @@ def test_sandbox_create_timeout_precedence_and_body():
         sandbox_api.SandboxClient = FakeClient
         os.environ["YR_SANDBOX_CREATE_TIMEOUT"] = "90"
         explicit = sandbox_api.Sandbox(
-            create_timeout=70, runtime="python3.9", detached=True
+            image="python:3.12-slim",
+            create_timeout=70,
+            runtime="kata",
+            detached=True,
         )
-        schedule_only = sandbox_api.Sandbox(schedule_timeout=45, detached=True)
-        inherited = sandbox_api.Sandbox(detached=True)
+        schedule_only = sandbox_api.Sandbox(
+            image="python:3.12-slim",
+            schedule_timeout=45,
+            detached=True,
+        )
+        inherited = sandbox_api.Sandbox(image="python:3.12-slim", detached=True)
         explicit.kill()
         schedule_only.kill()
         inherited.kill()
@@ -157,13 +164,13 @@ def test_sandbox_create_timeout_precedence_and_body():
             os.environ["YR_SANDBOX_CREATE_TIMEOUT"] = original_env
 
     _check(seen[0]["createTimeoutSeconds"] == 70, f"explicit timeout body: {seen[0]}")
-    _check(seen[0]["scheduleTimeoutSeconds"] == 40, f"derived schedule timeout body: {seen[0]}")
-    _check(seen[0]["runtime"] == "python3.9", f"runtime body: {seen[0]}")
-    _check(seen[1]["createTimeoutSeconds"] == 75, f"derived create timeout body: {seen[1]}")
+    _check(seen[0]["scheduleTimeoutSeconds"] == 30, f"default schedule timeout body: {seen[0]}")
+    _check(seen[0]["runtime"] == "kata", f"runtime body: {seen[0]}")
+    _check(seen[1]["createTimeoutSeconds"] == 90, f"env create timeout body: {seen[1]}")
     _check(seen[1]["scheduleTimeoutSeconds"] == 45, f"explicit schedule timeout body: {seen[1]}")
     _check(seen[2]["createTimeoutSeconds"] == 90, f"env timeout body: {seen[2]}")
-    _check(seen[2]["scheduleTimeoutSeconds"] == 60, f"env-derived schedule timeout body: {seen[2]}")
-    _check("runtime" not in seen[2], f"default runtime must stay frontend-owned: {seen[2]}")
+    _check(seen[2]["scheduleTimeoutSeconds"] == 30, f"default schedule timeout body: {seen[2]}")
+    _check(seen[2]["runtime"] == "runsc", f"default isolation runtime body: {seen[2]}")
     print("ok: Sandbox create timeout precedence and body")
 
 
@@ -171,7 +178,11 @@ def test_sandbox_create_timeout_validation():
     import yr_sandbox.sandbox_api as sandbox_api
 
     invalid = (
-        ({"create_timeout": 30}, "create_timeout must be greater than 30"),
+        (
+            {"create_timeout": 30},
+            "create_timeout - schedule_timeout must be at least 30",
+        ),
+        ({"schedule_timeout": -1}, "schedule_timeout must be a positive integer"),
         ({"schedule_timeout": 0}, "schedule_timeout must be a positive integer"),
         (
             {"create_timeout": 60, "schedule_timeout": 70},
@@ -184,7 +195,11 @@ def test_sandbox_create_timeout_validation():
     )
     for kwargs, message in invalid:
         try:
-            sandbox_api.Sandbox(detached=True, **kwargs)
+            sandbox_api.Sandbox(
+                image="python:3.12-slim",
+                detached=True,
+                **kwargs,
+            )
         except ValueError as exc:
             _check(str(exc) == message, f"unexpected validation error: {exc}")
         else:
@@ -209,36 +224,156 @@ def test_direct_success_no_fallback():
     print("ok: direct success, no fallback ->", calls)
 
 
-def test_direct_5xx_falls_back_and_sticks():
+def test_direct_5xx_does_not_retry_current_invoke_and_sticks():
     calls = []
 
     def handler(request: httpx.Request) -> httpx.Response:
-        calls.append(request.url.path)
+        body = json.loads(request.content)
+        calls.append(
+            (
+                request.url.path,
+                request.headers.get("x-yr-request-id"),
+                body.get("requestId"),
+            )
+        )
         if request.url.path.startswith("/api/sandbox/v1"):
             return httpx.Response(200, json=_envelope({"exists": True}))
         return httpx.Response(503, json={"error": "route unavailable"})
 
     c = _make_client(handler)
-    out = c.invoke("sandbox-demo", "file.exists", {"path": "/"})
-    _check(out == {"exists": True}, f"fallback result: {out}")
+    try:
+        c.invoke("sandbox-demo", "process.exec", {"cmd": ["touch", "/tmp/once"]})
+    except SandboxError as exc:
+        _check("outcome is unknown" in str(exc), f"unexpected 5xx error: {exc}")
+        _check(calls[0][1] in str(exc), f"request id missing from error: {exc}")
+    else:
+        raise AssertionError("5xx direct invoke must not retry through frontend")
     _check(
-        calls[0] == "/direct/sandbox-demo/invoke",
-        f"first call direct: {calls}",
+        calls == [
+            (
+                "/direct/sandbox-demo/invoke",
+                calls[0][1],
+                calls[0][1],
+            )
+        ],
+        f"current invoke must be sent once: {calls}",
     )
-    _check(calls[1].startswith("/api/sandbox/v1"), f"second call frontend: {calls}")
-    # sticky: a subsequent call skips direct entirely
-    out2 = c.invoke("sandbox-demo", "file.exists", {"path": "/"})
-    _check(out2 == {"exists": True}, f"second invoke: {out2}")
-    _check(calls[2].startswith("/api/sandbox/v1"), f"sticky skip direct: {calls}")
-    _check(c._direct_disabled is True, "direct should be sticky-disabled")
-    print("ok: 5xx fallback + sticky disable ->", calls)
+    _check(c._direct_disabled is True, "5xx should sticky-disable direct")
+
+    # A later logical invocation may use the fallback path.
+    out = c.invoke("sandbox-demo", "file.exists", {"path": "/"})
+    _check(out == {"exists": True}, f"later fallback result: {out}")
+    _check(
+        calls[1][0].startswith("/api/sandbox/v1"),
+        f"later call should skip direct: {calls}",
+    )
+    _check(
+        calls[1][1] == calls[1][2] and calls[1][1],
+        f"fallback request id should be observable: {calls}",
+    )
+    print("ok: 5xx is not retried; later invoke uses sticky fallback ->", calls)
+
+
+def test_direct_read_timeout_does_not_retry_unknown_outcome():
+    calls = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        body = json.loads(request.content)
+        calls.append(
+            (
+                request.url.path,
+                request.headers.get("x-yr-request-id"),
+                body.get("requestId"),
+            )
+        )
+        if request.url.path.startswith("/api/sandbox/v1"):
+            return httpx.Response(200, json=_envelope({"ok": True}))
+        raise httpx.ReadTimeout(
+            "response lost after possible execution",
+            request=request,
+        )
+
+    c = _make_client(handler)
+    try:
+        c.invoke("sandbox-demo", "process.start", {"cmd": ["side-effect"]})
+    except SandboxError as exc:
+        _check("outcome is unknown" in str(exc), f"unexpected timeout error: {exc}")
+        _check(calls[0][1] in str(exc), f"request id missing from error: {exc}")
+    else:
+        raise AssertionError("read timeout must not retry an unknown outcome")
+    _check(
+        len(calls) == 1 and calls[0][0] == "/direct/sandbox-demo/invoke",
+        f"read timeout retried the action: {calls}",
+    )
+    _check(c._direct_disabled is True, "read timeout should sticky-disable direct")
+    print("ok: read timeout does not retry unknown outcome ->", calls)
+
+
+def test_direct_4xx_does_not_fallback():
+    for status in (400, 401, 403, 409, 429):
+        calls = []
+
+        def handler(
+            request: httpx.Request,
+            status=status,
+            calls=calls,
+        ) -> httpx.Response:
+            calls.append(request.url.path)
+            if request.url.path.startswith("/api/sandbox/v1"):
+                return httpx.Response(200, json=_envelope({"ok": True}))
+            return httpx.Response(status, json={"error": f"status-{status}"})
+
+        c = _make_client(handler)
+        try:
+            c.invoke("sandbox-demo", "process.exec", {"cmd": ["side-effect"]})
+        except SandboxError as exc:
+            _check(f"HTTP {status}" in str(exc), f"unexpected {status} error: {exc}")
+        else:
+            raise AssertionError(f"HTTP {status} must not fall back")
+        _check(
+            calls == ["/direct/sandbox-demo/invoke"],
+            f"HTTP {status} retried through frontend: {calls}",
+        )
+        _check(c._direct_disabled is False, f"HTTP {status} should not disable direct")
+    print("ok: direct 4xx responses do not fall back")
+
+
+def test_direct_invalid_json_does_not_retry_unknown_outcome():
+    calls = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        calls.append(request.url.path)
+        if request.url.path.startswith("/api/sandbox/v1"):
+            return httpx.Response(200, json=_envelope({"ok": True}))
+        return httpx.Response(200, content=b"not-json")
+
+    c = _make_client(handler)
+    try:
+        c.invoke("sandbox-demo", "process.exec", {"cmd": ["side-effect"]})
+    except SandboxError as exc:
+        _check("invalid JSON" in str(exc), f"unexpected invalid JSON error: {exc}")
+    else:
+        raise AssertionError("invalid direct response must not retry")
+    _check(
+        calls == ["/direct/sandbox-demo/invoke"],
+        f"invalid direct response retried through frontend: {calls}",
+    )
+    _check(c._direct_disabled is True, "invalid response should disable direct")
+    print("ok: invalid direct response does not retry unknown outcome")
 
 
 def test_direct_connect_error_falls_back():
     calls = []
 
     def handler(request: httpx.Request) -> httpx.Response:
-        calls.append(request.url.path)
+        body = json.loads(request.content)
+        calls.append(
+            (
+                request.url.path,
+                request.headers.get("x-yr-request-id"),
+                body.get("requestId"),
+            )
+        )
         if request.url.path.startswith("/api/sandbox/v1"):
             return httpx.Response(200, json=_envelope({"ok": 1}))
         raise httpx.ConnectError("direct route down")
@@ -247,6 +382,15 @@ def test_direct_connect_error_falls_back():
     out = c.invoke("sandbox-demo", "file.exists", {"path": "/"})
     _check(out == {"ok": 1}, f"connect-error fallback: {out}")
     _check(c._direct_disabled is True, "connect error should sticky-disable")
+    _check(
+        calls[0][0] == "/direct/sandbox-demo/invoke",
+        f"first call direct: {calls}",
+    )
+    _check(calls[1][0].startswith("/api/sandbox/v1"), f"fallback: {calls}")
+    _check(
+        calls[0][1] == calls[0][2] == calls[1][1] == calls[1][2],
+        f"fallback must reuse the logical request id: {calls}",
+    )
     print("ok: connect-error fallback ->", calls)
 
 
@@ -255,7 +399,14 @@ def test_direct_fallback_when_frontend_direct_missing():
     calls = []
 
     def handler(request: httpx.Request) -> httpx.Response:
-        calls.append(request.url.path)
+        body = json.loads(request.content)
+        calls.append(
+            (
+                request.url.path,
+                request.headers.get("x-yr-request-id"),
+                body.get("requestId"),
+            )
+        )
         if request.url.path.startswith("/api/sandbox/v1"):
             return httpx.Response(200, json=_envelope({"exists": False}))
         return httpx.Response(404, json={"error": "direct route missing"})
@@ -272,10 +423,14 @@ def test_direct_fallback_when_frontend_direct_missing():
     out = c.invoke("sandbox-demo", "file.exists", {"path": "/"})
     _check(out == {"exists": False}, f"frontend-only result: {out}")
     _check(
-        calls[0] == "/direct/sandbox-demo/invoke",
+        calls[0][0] == "/direct/sandbox-demo/invoke",
         f"first call direct: {calls}",
     )
-    _check(calls[1].startswith("/api/sandbox/v1"), f"fallback: {calls}")
+    _check(calls[1][0].startswith("/api/sandbox/v1"), f"fallback: {calls}")
+    _check(
+        calls[0][1] == calls[0][2] == calls[1][1] == calls[1][2],
+        f"404 fallback must reuse the logical request id: {calls}",
+    )
     print("ok: missing frontend /direct -> fallback ->", calls)
 
 
@@ -711,7 +866,12 @@ def test_reverse_tunnel_url_uses_gateway_tunnel_alias():
     try:
         sandbox_api.SandboxClient = FakeClient
         tunnel_client.TunnelClient = FakeTunnelClient
-        sb = sandbox_api.Sandbox(upstream="127.0.0.1:8000", tunnel_connect_timeout=1, detached=True)
+        sb = sandbox_api.Sandbox(
+            image="python:3.12-slim",
+            upstream="127.0.0.1:8000",
+            tunnel_connect_timeout=1,
+            detached=True,
+        )
         _check(sb.get_tunnel_url() == "http://127.0.0.1:8766", "sandbox-side tunnel URL mismatch")
         sb.kill()
     finally:
@@ -797,6 +957,7 @@ def test_reverse_tunnel_uses_frontend_returned_tunnel_metadata():
         sandbox_api.SandboxClient = FakeClient
         tunnel_client.TunnelClient = FakeTunnelClient
         sb = sandbox_api.Sandbox(
+            image="python:3.12-slim",
             upstream="127.0.0.1:8000",
             proxy_port=9876,
             env={"USER_ENV": "ok"},
@@ -911,7 +1072,10 @@ if __name__ == "__main__":
     test_sandbox_create_timeout_precedence_and_body()
     test_sandbox_create_timeout_validation()
     test_direct_success_no_fallback()
-    test_direct_5xx_falls_back_and_sticks()
+    test_direct_5xx_does_not_retry_current_invoke_and_sticks()
+    test_direct_read_timeout_does_not_retry_unknown_outcome()
+    test_direct_4xx_does_not_fallback()
+    test_direct_invalid_json_does_not_retry_unknown_outcome()
     test_direct_connect_error_falls_back()
     test_direct_fallback_when_frontend_direct_missing()
     test_direct_binary_upload_success()

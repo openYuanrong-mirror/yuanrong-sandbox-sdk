@@ -1,4 +1,13 @@
-from .types import CommandResult, EntryInfo, Mount, S3Config, SandboxInfo
+from .types import (
+    CommandInfo,
+    CommandResult,
+    EntryInfo,
+    Mount,
+    NodeInfo,
+    PortForwarding,
+    S3Config,
+    SandboxInfo,
+)
 
 __all__ = [
     # current API
@@ -6,13 +15,19 @@ __all__ = [
     "Shell",
     "Shells",
     "CommandHandle",
+    "Pty",
+    "PtySession",
+    "PtyError",
     # data types
     "EntryInfo",
     "CommandResult",
+    "CommandInfo",
     "SandboxInfo",
     "Mount",
     "S3Config",
     "PortForwarding",
+    "NodeInfo",
+    "resources",
 ]
 
 # Heavy modules are lazy-loaded so lightweight entry points (the yr-sandbox CLI)
@@ -22,7 +37,13 @@ _lazy_imports = {
     "Shell": ".shell",
     "Shells": ".shell",
     "CommandHandle": ".commands",
+    "Pty": ".pty",
+    "PtySession": ".pty",
+    "PtyError": ".pty",
     "PortForwarding": ".types",
+    "NodeInfo": ".types",
+    "CommandInfo": ".types",
+    "resources": "._resources",
 }
 
 

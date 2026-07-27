@@ -1,0 +1,26 @@
+{
+  "sdk": "sandbox-python",
+  "exports": [
+    "Sandbox",
+    "Shell",
+    "Shells",
+    "CommandHandle",
+    "Pty",
+    "PtySession",
+    "PtyError",
+    "EntryInfo",
+    "CommandResult",
+    "CommandInfo",
+    "SandboxInfo",
+    "Mount",
+    "S3Config",
+    "PortForwarding",
+    "NodeInfo",
+    "resources"
+  ],
+  "types": {
+    "Sandbox": {
+      "runtime": ["runsc", "kata"]
+    }
+  }
+}

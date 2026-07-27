@@ -1,5 +1,5 @@
-from dataclasses import dataclass
-from typing import Any, Dict, Optional
+from dataclasses import dataclass, field
+from typing import Any, Dict, Mapping, Optional
 
 # Default action timeout in seconds.
 YR_GET_DEFAULT_TIMEOUT = 300
@@ -9,7 +9,7 @@ YR_GET_DEFAULT_TIMEOUT = 300
 YR_GET_TIMEOUT_BUFFER = 30
 
 
-@dataclass
+@dataclass(frozen=True)
 class PortForwarding:
     """Port-forwarding descriptor.
 
@@ -22,7 +22,7 @@ class PortForwarding:
     protocol: str = "TCP"
 
 
-@dataclass
+@dataclass(frozen=True)
 class EntryInfo:
     name: str
     path: str
@@ -32,23 +32,23 @@ class EntryInfo:
     modified_time: float
 
 
-@dataclass
+@dataclass(frozen=True)
 class CommandResult:
     stdout: str
     stderr: str
     exit_code: int
 
 
-@dataclass
+@dataclass(frozen=True)
 class SandboxInfo:
-    sandbox_id: str
+    id: str
     state: str  # "running" | "stopped"
     cpu: Optional[int]
     memory: Optional[int]
     image: Optional[str]
 
 
-@dataclass
+@dataclass(frozen=True)
 class S3Config:
     """S3 object storage configuration."""
 
@@ -56,7 +56,13 @@ class S3Config:
     bucket: str
     object: str
     access_key: Optional[str] = None
-    secret_key: Optional[str] = None
+    secret_key: Optional[str] = field(default=None, repr=False)
+
+    def __post_init__(self) -> None:
+        for field_name in ("endpoint", "bucket", "object"):
+            value = getattr(self, field_name)
+            if not isinstance(value, str) or not value.strip():
+                raise ValueError(f"{field_name} must be a non-empty string")
 
     def to_dict(self) -> Dict[str, Any]:
         d: Dict[str, Any] = {
@@ -71,7 +77,7 @@ class S3Config:
         return d
 
 
-@dataclass
+@dataclass(frozen=True)
 class Mount:
     """Read-only mount configuration for Sandbox.
 
@@ -101,12 +107,18 @@ class Mount:
     type: str = "bind"
 
     def __post_init__(self) -> None:
+        if not isinstance(self.target, str) or not self.target.startswith("/"):
+            raise ValueError("target must be an absolute sandbox path")
         sources = [self.image_url, self.s3_config]
         count = sum(1 for s in sources if s is not None)
         if count != 1:
             raise ValueError(
                 f"Exactly one of image_url, s3_config must be specified, got {count}"
             )
+        if self.image_url is not None and (
+            not isinstance(self.image_url, str) or not self.image_url.strip()
+        ):
+            raise ValueError("image_url must be a non-empty string")
         if self.type not in ("bind", "erofs"):
             raise ValueError(f"type must be 'bind' or 'erofs', got {self.type!r}")
 
@@ -121,3 +133,19 @@ class Mount:
         if self.s3_config is not None:
             d["s3_config"] = self.s3_config.to_dict()
         return d
+
+
+@dataclass(frozen=True)
+class NodeInfo:
+    id: str
+    status: int
+    capacity: Mapping[str, float]
+    allocatable: Mapping[str, float]
+    labels: Mapping[str, Any]
+
+
+@dataclass(frozen=True)
+class CommandInfo:
+    pid: int
+    command: str
+    running: bool

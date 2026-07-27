@@ -28,12 +28,12 @@ Usage:
 
 import http.server
 import os
+import shlex
 import socket
 import sys
 import tempfile
 import threading
 import time
-import shlex
 
 # Disable SSL verification for test clusters with self-signed certificates
 os.environ.setdefault("TUNNEL_SSL_VERIFY", "0")
