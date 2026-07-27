@@ -25,3 +25,6 @@ fallback_version = "0.10.0"
 
 [tool.setuptools.packages.find]
 include = ["yr_sandbox*"]
+
+[tool.setuptools.package-data]
+yr_sandbox = ["py.typed"]

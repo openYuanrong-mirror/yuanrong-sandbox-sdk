@@ -210,7 +210,7 @@ def main():
             if all_passed:
                 print(f"\n\033[32mALL TESTS PASSED\033[0m - Tunnel correctly returned data up to {TEST_SIZES[-1][0]}")
             else:
-                print(f"\n\033[31mSOME TESTS FAILED\033[0m (large sizes may be intermittent)")
+                print("\n\033[31mSOME TESTS FAILED\033[0m (large sizes may be intermittent)")
 
         print("\nSandbox terminated.")
     finally:

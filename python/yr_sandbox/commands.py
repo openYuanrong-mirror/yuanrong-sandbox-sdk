@@ -20,7 +20,7 @@ import time
 from typing import Dict, List, Optional, Union
 
 from ._transport import SandboxClient
-from .types import CommandResult
+from .types import CommandInfo, CommandResult
 
 logger = logging.getLogger(__name__)
 
@@ -122,9 +122,15 @@ class CommandHandle:
 class Commands:
     """Client-side wrapper for command execution on the remote sandbox."""
 
-    def __init__(self, client: SandboxClient, sandbox_id: str):
+    def __init__(
+        self,
+        client: SandboxClient,
+        sandbox_id: str,
+        default_cwd: Optional[str] = None,
+    ):
         self._client = client
         self._sid = sandbox_id
+        self._default_cwd = default_cwd
 
     def run(
         self,
@@ -141,23 +147,39 @@ class Commands:
         (only with ``background=True``) keeps an open stdin PIPE so
         ``send_stdin`` can feed the process; otherwise stdin is /dev/null.
         """
+        if stdin and not background:
+            raise ValueError("stdin is only supported when background=True")
+        effective_cwd = cwd if cwd is not None else self._default_cwd
+
         if background:
             result = self._client.invoke(
                 self._sid,
                 "process.start",
-                {"cmd": cmd, "envs": envs, "cwd": cwd, "want_stdin": stdin},
+                {
+                    "cmd": cmd,
+                    "envs": envs,
+                    "cwd": effective_cwd,
+                    "want_stdin": stdin,
+                },
             )
             if result.get("error"):
                 raise RuntimeError(f"Failed to start command: {result['error']}")
             return CommandHandle(result["pid"], self._client, self._sid)
 
         if timeout > _POLL_THRESHOLD:
-            return self._run_with_poll(cmd, envs=envs, cwd=cwd, timeout=timeout)
+            return self._run_with_poll(
+                cmd, envs=envs, cwd=effective_cwd, timeout=timeout
+            )
 
         result = self._client.invoke(
             self._sid,
             "process.exec",
-            {"cmd": cmd, "envs": envs, "cwd": cwd, "timeout": timeout},
+            {
+                "cmd": cmd,
+                "envs": envs,
+                "cwd": effective_cwd,
+                "timeout": timeout,
+            },
             timeout=timeout,
         )
         return CommandResult(
@@ -180,8 +202,22 @@ class Commands:
             raise RuntimeError(f"Failed to start command: {result['error']}")
         return _poll_pid_until_done(self._client, self._sid, result["pid"], timeout)
 
-    def list(self) -> List[dict]:
-        return self._client.invoke(self._sid, "process.list", {})["processes"]
+    def list(self) -> List[CommandInfo]:
+        processes = self._client.invoke(self._sid, "process.list", {}).get("processes")
+        if not isinstance(processes, list):
+            return []
+        out: List[CommandInfo] = []
+        for item in processes:
+            if not isinstance(item, dict):
+                continue
+            out.append(
+                CommandInfo(
+                    pid=int(item.get("pid", 0)),
+                    command=str(item.get("cmd", "")),
+                    running=item.get("status") == "running",
+                )
+            )
+        return out
 
     def kill(self, pid: int) -> bool:
         return self._client.invoke(self._sid, "process.kill", {"pid": pid})["killed"]

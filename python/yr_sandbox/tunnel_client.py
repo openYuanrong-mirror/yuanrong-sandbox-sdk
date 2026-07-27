@@ -1,14 +1,14 @@
 """TunnelClient: WebSocket-based reverse tunnel for RRT sandboxes.
 
 Connects to the sandbox's tunnel WebSocket port through the sandbox
-router (or frontend gateway) and exposes a local HTTP proxy so sandbox
-code can reach services running on the client machine.
+router (or frontend gateway) and proxies HTTP and application WebSocket
+traffic to services running on the client machine.
 
 Architecture:
   [Local Machine]
     upstream (e.g. 127.0.0.1:8000)
          ^ HTTP
-    TunnelClient (WebSocket client + HTTP proxy)
+    TunnelClient (control WebSocket + HTTP/WebSocket proxy)
          | WS via router/gateway
          v
   [Sandbox]
@@ -21,8 +21,8 @@ import logging
 import os
 import threading
 import time
-from typing import Optional
-from urllib.parse import quote
+from typing import Any, Optional
+from urllib.parse import quote, urljoin, urlsplit, urlunsplit
 
 import websockets.asyncio.client as ws_client
 import websockets.exceptions as ws_exc
@@ -32,6 +32,7 @@ logger = logging.getLogger(__name__)
 _RECONNECT_DELAY = 1.0
 _COMPLETED_FRAME_TTL = 300.0
 _COMPLETED_FRAME_LIMIT = 1024
+_WS_CHANNEL_QUEUE_LIMIT = 100
 
 
 class TunnelClient:
@@ -52,7 +53,7 @@ class TunnelClient:
         self._thread: Optional[threading.Thread] = None
         self._connected = threading.Event()
         self._stopping = threading.Event()
-        self._ws = None
+        self._ws: Any = None
 
     def start(self, tunnel_ws_url: str, timeout: float = 60) -> bool:
         """Start the tunnel client in a background thread.
@@ -192,6 +193,7 @@ class TunnelClient:
         send_lock = asyncio.Lock()
         inflight: dict = {}
         completed: dict = {}
+        ws_channels: dict[str, asyncio.Queue] = {}
 
         async def send_frame(obj: dict) -> None:
             # websockets does not allow concurrent send() from multiple tasks;
@@ -224,9 +226,12 @@ class TunnelClient:
             try:
                 body_b64 = frame.get("body") or ""
                 body = base64.b64decode(body_b64) if body_b64 else b""
+                base_url = self._upstream
+                if "://" not in base_url:
+                    base_url = f"http://{base_url}"
                 resp = await client.request(
                     method,
-                    f"http://{self._upstream}{path}",
+                    urljoin(f"{base_url.rstrip('/')}/", path.lstrip("/")),
                     headers=req_headers or None,
                     content=body or None,
                 )
@@ -270,6 +275,151 @@ class TunnelClient:
                 task.add_done_callback(done_callback)
             return asyncio.ensure_future(await_and_send(rid, task))
 
+        def websocket_target(path: str) -> str:
+            base_url = self._upstream
+            if "://" not in base_url:
+                base_url = f"http://{base_url}"
+            target = urljoin(f"{base_url.rstrip('/')}/", path.lstrip("/"))
+            parsed = urlsplit(target)
+            if parsed.scheme == "http":
+                scheme = "ws"
+            elif parsed.scheme == "https":
+                scheme = "wss"
+            elif parsed.scheme in ("ws", "wss"):
+                scheme = parsed.scheme
+            else:
+                raise ValueError(
+                    f"unsupported reverse WebSocket target scheme: {parsed.scheme}"
+                )
+            return urlunsplit(parsed._replace(scheme=scheme))
+
+        def websocket_options(frame: dict) -> dict[str, Any]:
+            headers = frame.get("headers") or {}
+            additional_headers: dict[str, str] = {}
+            origin: str | None = None
+            subprotocols: list[str] | None = None
+            ignored = {
+                "connection",
+                "content-length",
+                "host",
+                "sec-websocket-extensions",
+                "sec-websocket-key",
+                "sec-websocket-version",
+                "upgrade",
+            }
+            for key, value in headers.items():
+                lower = key.lower()
+                if lower == "origin":
+                    origin = value
+                elif lower == "sec-websocket-protocol":
+                    subprotocols = [
+                        item.strip() for item in value.split(",") if item.strip()
+                    ]
+                elif lower not in ignored:
+                    additional_headers[key] = value
+            options: dict[str, Any] = {
+                "max_size": 2**23,
+                "additional_headers": additional_headers or None,
+            }
+            if origin:
+                options["origin"] = origin
+            if subprotocols:
+                options["subprotocols"] = subprotocols
+            return options
+
+        async def handle_ws_connect(frame: dict) -> None:
+            rid = frame.get("id", "")
+            if not rid:
+                return
+            if rid in ws_channels:
+                await send_frame(
+                    {
+                        "type": "error",
+                        "id": rid,
+                        "message": "duplicate WebSocket channel id",
+                    }
+                )
+                return
+
+            queue: asyncio.Queue = asyncio.Queue(maxsize=_WS_CHANNEL_QUEUE_LIMIT)
+            ws_channels[rid] = queue
+            try:
+                async with ws_client.connect(
+                    websocket_target(frame.get("path", "/")),
+                    **websocket_options(frame),
+                ) as upstream_ws:
+                    await send_frame({"type": "ws_connected", "id": rid})
+
+                    async def from_upstream() -> None:
+                        async for upstream_message in upstream_ws:
+                            if isinstance(upstream_message, str):
+                                data = upstream_message
+                                binary = False
+                            else:
+                                data = base64.b64encode(upstream_message).decode("ascii")
+                                binary = True
+                            await send_frame(
+                                {
+                                    "type": "ws_message",
+                                    "id": rid,
+                                    "data": data,
+                                    "binary": binary,
+                                }
+                            )
+
+                    async def from_sandbox() -> None:
+                        while True:
+                            channel_frame = await queue.get()
+                            frame_type = channel_frame.get("type")
+                            if frame_type == "ws_message":
+                                data = channel_frame.get("data", "")
+                                if channel_frame.get("binary", False):
+                                    data = base64.b64decode(data, validate=True)
+                                await upstream_ws.send(data)
+                            elif frame_type == "ws_close":
+                                code = channel_frame.get("code", 1000)
+                                reason = channel_frame.get("reason", "")
+                                await upstream_ws.close(code=code, reason=reason)
+                                return
+
+                    upstream_task = asyncio.create_task(from_upstream())
+                    sandbox_task = asyncio.create_task(from_sandbox())
+                    done, pending = await asyncio.wait(
+                        (upstream_task, sandbox_task),
+                        return_when=asyncio.FIRST_COMPLETED,
+                    )
+                    for task in pending:
+                        task.cancel()
+                    if pending:
+                        await asyncio.gather(*pending, return_exceptions=True)
+                    for task in done:
+                        task.result()
+
+                    await send_frame(
+                        {
+                            "type": "ws_close",
+                            "id": rid,
+                            "code": upstream_ws.close_code or 1000,
+                            "reason": upstream_ws.close_reason or "",
+                        }
+                    )
+            except asyncio.CancelledError:
+                raise
+            except Exception as exc:
+                logger.debug("tunnel ws_connect upstream error: %s", exc)
+                try:
+                    await send_frame(
+                        {
+                            "type": "error",
+                            "id": rid,
+                            "message": str(exc),
+                        }
+                    )
+                except ws_exc.ConnectionClosed:
+                    pass
+            finally:
+                ws_channels.pop(rid, None)
+
         limits = httpx.Limits(max_keepalive_connections=5, max_connections=10)
         tasks: set = set()
         try:
@@ -295,6 +445,14 @@ class TunnelClient:
                         t = handle_http_req(client, frame)
                         tasks.add(t)
                         t.add_done_callback(tasks.discard)
+                    elif ftype == "ws_connect":
+                        t = asyncio.create_task(handle_ws_connect(frame))
+                        tasks.add(t)
+                        t.add_done_callback(tasks.discard)
+                    elif ftype in ("ws_message", "ws_close"):
+                        channel = ws_channels.get(frame.get("id", ""))
+                        if channel is not None:
+                            await channel.put(frame)
                     elif ftype == "ping":
                         await send_frame(
                             {
@@ -303,7 +461,11 @@ class TunnelClient:
                                 "timestamp": frame.get("timestamp", 0),
                             }
                         )
-                    # ws_connect/ws_message/ws_close: reverse WS tunneling is not
-                    # exercised by any sandbox example; ignore to keep the loop alive.
         except ws_exc.ConnectionClosed:
             pass
+        finally:
+            for task in list(tasks):
+                task.cancel()
+            if tasks:
+                await asyncio.gather(*tasks, return_exceptions=True)
+            ws_channels.clear()

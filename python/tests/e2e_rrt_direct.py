@@ -2,7 +2,7 @@
 
 Requires a deployed sandbox cluster. Wires the openyuanrong-sandbox to the frontend
 (``YR_SERVER_ADDRESS``). RRT direct invoke uses ``/direct`` on that endpoint,
-creates an rrt sandbox (no image -> the frontend's default rrt runtime),
+creates an RRT-backed sandbox from ``YR_SANDBOX_IMAGE``,
 exercises filesystem + command ops over the frontend /direct path, then asserts the
 direct path stayed healthy -- i.e. the ops reached the sandbox's rrt daemon
 through the frontend /direct route and never sticky-fell-back to the frontend tunnel.
@@ -14,6 +14,7 @@ Env:
   YR_SERVER_ADDRESS   frontend host:port (required)
   YR_TOKEN            auth token (any value when JWT disabled; default 'ci')
   YR_TLS              '0' for plain HTTP (default here)
+  YR_SANDBOX_MEMORY   scheduling memory in MB (default 4096)
 """
 
 import os
@@ -35,8 +36,10 @@ def _require(name: str) -> str:
 
 
 server = _require("YR_SERVER_ADDRESS")
+image = os.environ.get("YR_SANDBOX_IMAGE", "aio-yr-runtime:latest")
+memory = int(os.environ.get("YR_SANDBOX_MEMORY", "4096"))
 
-from yr_sandbox import Sandbox  # noqa: E402
+from yr_sandbox import Sandbox
 
 passed: list = []
 failed: list = []
@@ -49,10 +52,16 @@ def chk(name: str, cond: bool, detail: str = "") -> None:
 
 
 # Path lives inside the isolated sandbox container, not on the host.
-REMOTE_PATH = "/tmp/direct.txt"  # noqa: S108
+REMOTE_PATH = "/tmp/direct.txt"
 
 print(f"frontend={server} direct=/direct")
-sb = Sandbox(name="rrt-direct-e2e")  # no image -> default rrt runtime
+sb = Sandbox(
+    image=image,
+    name="rrt-direct-e2e",
+    memory=memory,
+    create_timeout=180,
+    schedule_timeout=120,
+)
 client = sb._client
 chk("create rrt sandbox", bool(sb.id), f"id={sb.id}")
 chk("direct path configured", client.direct_enabled is True, "path=/direct")

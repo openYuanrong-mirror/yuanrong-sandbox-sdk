@@ -9,7 +9,7 @@ import os
 import tarfile
 import tempfile
 import threading
-from typing import Iterator, List, Union
+from typing import Iterator, List, Literal, Union, overload
 
 from ._transport import SandboxClient
 from .types import EntryInfo
@@ -79,7 +79,15 @@ class Filesystem:
     def _invoke(self, action: str, **args) -> dict:
         return self._client.invoke(self._sid, action, args)
 
+    @overload
+    def read(self, path: str, format: Literal["text"] = "text") -> str: ...
+
+    @overload
+    def read(self, path: str, format: Literal["bytes"]) -> bytes: ...
+
     def read(self, path: str, format: str = "text") -> Union[str, bytes]:
+        if format not in ("text", "bytes"):
+            raise ValueError("format must be 'text' or 'bytes'")
         data = self._client.download_bytes_direct(self._sid, path, timeout_or_default())
         if format == "bytes":
             return data

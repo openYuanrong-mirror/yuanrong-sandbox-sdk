@@ -10,9 +10,15 @@ from .shell import Shell
 class Shells:
     """Factory for :class:`Shell` instances. Accessible as ``sandbox.shells``."""
 
-    def __init__(self, client: SandboxClient, sandbox_id: str):
+    def __init__(
+        self,
+        client: SandboxClient,
+        sandbox_id: str,
+        default_cwd: Optional[str] = None,
+    ):
         self._client = client
         self._sid = sandbox_id
+        self._default_cwd = default_cwd
         self._shells: List[Shell] = []
         self._counter = 0
 
@@ -39,10 +45,11 @@ class Shells:
         sh = Shell(self._client, self._sid, session_id)
         self._shells.append(sh)
 
-        if cwd or envs:
+        effective_cwd = cwd if cwd is not None else self._default_cwd
+        if effective_cwd or envs:
             init_parts = []
-            if cwd:
-                init_parts.append(f"cd {cwd}")
+            if effective_cwd:
+                init_parts.append(f"cd {effective_cwd}")
             if envs:
                 for k, v in envs.items():
                     init_parts.append(f"export {k}='{v}'")
