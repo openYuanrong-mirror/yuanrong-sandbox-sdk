@@ -5,6 +5,7 @@ import base64
 import gzip
 import http.server
 import json
+import logging
 import os
 import ssl
 import threading
@@ -269,6 +270,49 @@ class TunnelClientTlsTests(unittest.IsolatedAsyncioTestCase):
         output = "\n".join(logs.output)
         self.assertIn("route unavailable", output)
         self.assertNotIn("unexpected error", output)
+
+    async def test_repeated_route_404_emits_bounded_warnings(self):
+        client = TunnelClient(upstream="127.0.0.1:1")
+        attempts = 0
+
+        class _RepeatedRejection:
+            async def __aenter__(self):
+                nonlocal attempts
+                attempts += 1
+                if attempts == 10:
+                    client._stopping.set()
+                from websockets.datastructures import Headers
+                from websockets.http11 import Response
+
+                raise tunnel_client.ws_exc.InvalidStatus(
+                    Response(404, "Not Found", Headers(), b"")
+                )
+
+            async def __aexit__(self, *_args):
+                return False
+
+        with (
+            mock.patch.object(
+                tunnel_client.ws_client,
+                "connect",
+                side_effect=lambda *_args, **_kwargs: _RepeatedRejection(),
+            ),
+            mock.patch.object(
+                tunnel_client.asyncio,
+                "sleep",
+                new=mock.AsyncMock(),
+            ),
+            self.assertLogs(tunnel_client.logger, level="DEBUG") as logs,
+        ):
+            await client._connect_loop("ws://router.test/tunnel/sandbox")
+
+        warnings = [
+            record for record in logs.records if record.levelno >= logging.WARNING
+        ]
+        self.assertEqual(attempts, 10)
+        self.assertEqual(len(warnings), 2)
+        self.assertIn("attempt 5", warnings[0].getMessage())
+        self.assertIn("attempt 10", warnings[1].getMessage())
 
     async def test_non_404_handshake_rejection_stays_visible(self):
         client = TunnelClient(upstream="127.0.0.1:1")

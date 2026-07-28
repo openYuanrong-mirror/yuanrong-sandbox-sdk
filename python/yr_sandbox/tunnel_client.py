@@ -32,6 +32,8 @@ import websockets.exceptions as ws_exc
 logger = logging.getLogger(__name__)
 
 _RECONNECT_DELAY = 1.0
+_ROUTE_404_WARNING_THRESHOLD = 5
+_ROUTE_404_WARNING_INTERVAL = 10
 _COMPLETED_FRAME_TTL = 300.0
 _COMPLETED_FRAME_LIMIT = 1024
 _WS_CHANNEL_QUEUE_LIMIT = 100
@@ -238,12 +240,16 @@ class TunnelClient:
                 failures += 1
                 status_code = e.response.status_code
                 if status_code == 404:
-                    # A newly-created or recently-deleted sandbox may not have
-                    # a router entry yet. Retrying is expected and shouldn't
-                    # emit an error every second at the default log level.
-                    logger.debug(
-                        "TunnelClient route unavailable (HTTP 404, attempt %d); "
-                        "retrying",
+                    # Hide the short route-publication window, but surface a
+                    # persistent missing route without logging every second.
+                    warn = failures == _ROUTE_404_WARNING_THRESHOLD or (
+                        failures > _ROUTE_404_WARNING_THRESHOLD
+                        and failures % _ROUTE_404_WARNING_INTERVAL == 0
+                    )
+                    log = logger.warning if warn else logger.debug
+                    log(
+                        "TunnelClient route unavailable "
+                        "(HTTP 404, attempt %d); retrying",
                         failures,
                     )
                 else:
