@@ -233,6 +233,30 @@ class TunnelClient:
                 if self._stopping.is_set():
                     return
                 await asyncio.sleep(min(_RECONNECT_DELAY * min(failures, 30), 30))
+            except ws_exc.InvalidStatus as e:
+                self._connected.clear()
+                failures += 1
+                status_code = e.response.status_code
+                if status_code == 404:
+                    # A newly-created or recently-deleted sandbox may not have
+                    # a router entry yet. Retrying is expected and shouldn't
+                    # emit an error every second at the default log level.
+                    logger.debug(
+                        "TunnelClient route unavailable (HTTP 404, attempt %d); "
+                        "retrying",
+                        failures,
+                    )
+                else:
+                    logger.warning(
+                        "TunnelClient WebSocket handshake rejected "
+                        "(HTTP %d, attempt %d): %s",
+                        status_code,
+                        failures,
+                        e,
+                    )
+                if self._stopping.is_set():
+                    return
+                await asyncio.sleep(_RECONNECT_DELAY)
             except Exception as e:
                 failures += 1
                 logger.error("TunnelClient unexpected error: %s", e)

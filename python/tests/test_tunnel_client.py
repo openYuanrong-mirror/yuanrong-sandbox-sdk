@@ -234,6 +234,59 @@ class TunnelClientRequestTests(unittest.IsolatedAsyncioTestCase):
 
 
 class TunnelClientTlsTests(unittest.IsolatedAsyncioTestCase):
+    @staticmethod
+    def _rejected_connection(client, status_code):
+        from websockets.datastructures import Headers
+        from websockets.http11 import Response
+
+        error = tunnel_client.ws_exc.InvalidStatus(
+            Response(status_code, "Rejected", Headers(), b"")
+        )
+
+        class _RejectedConnection:
+            async def __aenter__(self):
+                client._stopping.set()
+                raise error
+
+            async def __aexit__(self, *_args):
+                return False
+
+        return _RejectedConnection()
+
+    async def test_route_not_ready_404_is_debug_only(self):
+        client = TunnelClient(upstream="127.0.0.1:1")
+
+        with (
+            mock.patch.object(
+                tunnel_client.ws_client,
+                "connect",
+                return_value=self._rejected_connection(client, 404),
+            ),
+            self.assertLogs(tunnel_client.logger, level="DEBUG") as logs,
+        ):
+            await client._connect_loop("ws://router.test/tunnel/sandbox")
+
+        output = "\n".join(logs.output)
+        self.assertIn("route unavailable", output)
+        self.assertNotIn("unexpected error", output)
+
+    async def test_non_404_handshake_rejection_stays_visible(self):
+        client = TunnelClient(upstream="127.0.0.1:1")
+
+        with (
+            mock.patch.object(
+                tunnel_client.ws_client,
+                "connect",
+                return_value=self._rejected_connection(client, 403),
+            ),
+            self.assertLogs(tunnel_client.logger, level="WARNING") as logs,
+        ):
+            await client._connect_loop("ws://router.test/tunnel/sandbox")
+
+        output = "\n".join(logs.output)
+        self.assertIn("handshake rejected", output)
+        self.assertIn("HTTP 403", output)
+
     async def test_wss_uses_default_certificate_and_hostname_verification(self):
         client = TunnelClient(upstream="127.0.0.1:1")
         captured = {}
