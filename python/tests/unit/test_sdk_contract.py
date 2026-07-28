@@ -78,6 +78,18 @@ class SDKContractTests(unittest.TestCase):
             "/workspace",
         )
 
+    def test_sandbox_forwards_runtime_without_owning_runtime_registry(self):
+        with patch("yr_sandbox.sandbox_api.SandboxClient", _FakeClient):
+            Sandbox(
+                image="ubuntu:22.04",
+                runtime="gvisor-next",
+                detached=True,
+            )
+
+        body = _FakeClient.created[-1]
+        self.assertEqual(body["runtime"], "gvisor-next")
+        self.assertEqual(body["rootfs"]["runtime"], "gvisor-next")
+
     def test_node_id_is_encoded_as_frontend_affinity_semantics(self):
         with patch("yr_sandbox.sandbox_api.SandboxClient", _FakeClient):
             Sandbox(

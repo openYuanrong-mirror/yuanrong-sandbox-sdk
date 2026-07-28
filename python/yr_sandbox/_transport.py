@@ -27,6 +27,7 @@ from typing import Any, Dict, Iterable, Optional
 import httpx
 
 # Default per-call timeout buffer, mirroring types.YR_GET_TIMEOUT_BUFFER.
+from ._http_pool import acquire_shared_http_client
 from .types import YR_GET_DEFAULT_TIMEOUT, YR_GET_TIMEOUT_BUFFER
 
 
@@ -63,7 +64,7 @@ class SandboxClient:
         *,
         verify_tls: bool = False,
     ):
-        self._server = server or _require_env("YR_SERVER_ADDRESS")
+        self._server = (server or _require_env("YR_SERVER_ADDRESS")).rstrip("/")
         self._token = token or _require_env("YR_TOKEN")
         # Production gateways are TLS. Set YR_TLS=0 for a plain-HTTP dev
         # cluster (e.g. an AIO frontend started with frontend_ssl_enable=false).
@@ -75,13 +76,13 @@ class SandboxClient:
         scheme = "https" if self._tls else "http"
         self._origin = f"{scheme}://{self._server}"
         self._base = f"{scheme}://{self._server}/api/sandbox/v1"
-        # TLS verification is controlled by the caller. timeout=None lets each
-        # request pass an explicit timeout so long-running invokes are not cut
-        # off by a client-side default.
-        self._http = httpx.Client(
-            verify=verify_tls,
-            timeout=None,  # noqa: S113 — per-request timeouts passed explicitly
-            headers={"X-Auth": self._token},
+        # The process-level client owns TCP/TLS pooling. Authentication remains
+        # on this per-Sandbox lease and is injected into every request.
+        self._http = acquire_shared_http_client(
+            scheme,
+            self._server,
+            verify_tls,
+            self._token,
         )
 
         # ── HTTP-direct-via-frontend /direct route ──────────────────────────
