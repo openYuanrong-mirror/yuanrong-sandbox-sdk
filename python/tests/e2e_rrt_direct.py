@@ -2,7 +2,7 @@
 
 Requires a deployed sandbox cluster. Wires the openyuanrong-sandbox to the frontend
 (``YR_SERVER_ADDRESS``). RRT direct invoke uses ``/direct`` on that endpoint,
-creates an RRT-backed sandbox from ``YR_SANDBOX_IMAGE``,
+creates an RRT-backed sandbox using the deployment's default runtime image,
 exercises filesystem + command ops over the frontend /direct path, then asserts the
 direct path stayed healthy -- i.e. the ops reached the sandbox's rrt daemon
 through the frontend /direct route and never sticky-fell-back to the frontend tunnel.
@@ -36,7 +36,6 @@ def _require(name: str) -> str:
 
 
 server = _require("YR_SERVER_ADDRESS")
-image = os.environ.get("YR_SANDBOX_IMAGE", "aio-yr-runtime:latest")
 memory = int(os.environ.get("YR_SANDBOX_MEMORY", "4096"))
 
 from yr_sandbox import Sandbox
@@ -56,7 +55,6 @@ REMOTE_PATH = "/tmp/direct.txt"
 
 print(f"frontend={server} direct=/direct")
 sb = Sandbox(
-    image=image,
     name="rrt-direct-e2e",
     memory=memory,
     create_timeout=180,
