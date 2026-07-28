@@ -158,7 +158,8 @@ class Sandbox:
         Args:
             image: Container image to use (e.g. ``"python:3.12-slim"``).
             rootfs: S3-compatible EROFS root filesystem configuration.
-            runtime: Sandbox isolation runtime: ``runsc`` or ``kata``.
+            runtime: Sandbox isolation runtime identifier. Defaults to
+                ``runsc`` and is validated by the runtime layer.
             cpu: CPU scheduling request in milli-cores (default 1000).
             memory: Memory scheduling request in MB (default 4096).
             cpu_limit: CPU cgroup limit in milli-cores (0 = same as *cpu*).
@@ -189,8 +190,6 @@ class Sandbox:
             raise TypeError("rootfs must be an S3Config")
         if image is not None and rootfs is not None:
             raise ValueError("image and rootfs are mutually exclusive")
-        if runtime not in ("runsc", "kata"):
-            raise ValueError("runtime must be one of: runsc, kata")
         if env is not None and (
             not isinstance(env, Mapping)
             or not all(
