@@ -23,6 +23,7 @@ import os
 import ssl
 import threading
 import time
+import uuid
 from typing import Any, Optional
 from urllib.parse import quote, urljoin, urlsplit, urlunsplit
 
@@ -32,6 +33,8 @@ import websockets.exceptions as ws_exc
 logger = logging.getLogger(__name__)
 
 _RECONNECT_DELAY = 1.0
+_PING_INTERVAL = 20.0
+_PING_TIMEOUT = 10.0
 _ROUTE_404_WARNING_THRESHOLD = 5
 _ROUTE_404_WARNING_INTERVAL = 10
 _COMPLETED_FRAME_TTL = 300.0
@@ -116,11 +119,27 @@ class TunnelClient:
         tunnel.start("ws://router/safeID/8765", timeout=30)
         # sandbox code can now reach local :8000 via its proxy port
         tunnel.stop()
+
+    ``ping_interval`` and ``ping_timeout`` configure JSON application
+    heartbeats. WebSocket protocol ping is disabled because some gateways
+    don't count control frames when enforcing idle timeouts.
     """
 
-    def __init__(self, upstream: str, token: Optional[str] = None):
+    def __init__(
+        self,
+        upstream: str,
+        token: Optional[str] = None,
+        ping_interval: float = _PING_INTERVAL,
+        ping_timeout: float = _PING_TIMEOUT,
+    ):
+        if ping_interval <= 0:
+            raise ValueError("ping_interval must be greater than zero")
+        if ping_timeout <= 0:
+            raise ValueError("ping_timeout must be greater than zero")
         self._upstream = upstream
         self._token = token
+        self._ping_interval = ping_interval
+        self._ping_timeout = ping_timeout
         self._loop: Optional[asyncio.AbstractEventLoop] = None
         self._thread: Optional[threading.Thread] = None
         self._connected = threading.Event()
@@ -211,8 +230,11 @@ class TunnelClient:
                 async with ws_client.connect(
                     connect_url,
                     max_size=2**23,
-                    ping_interval=20,
-                    ping_timeout=10,
+                    # Use JSON application frames for the tunnel heartbeat.
+                    # Some gateways don't count WebSocket control frames as
+                    # activity and close otherwise healthy idle tunnels.
+                    ping_interval=None,
+                    ping_timeout=None,
                     close_timeout=5,
                     ssl=_ssl_ctx,
                     additional_headers=_extra_headers,
@@ -291,12 +313,46 @@ class TunnelClient:
         inflight: dict = {}
         completed: dict = {}
         ws_channels: dict[str, asyncio.Queue] = {}
+        pong_received = asyncio.Event()
+        pending_ping_id: str | None = None
+        heartbeat_timed_out = asyncio.Event()
 
         async def send_frame(obj: dict) -> None:
             # websockets does not allow concurrent send() from multiple tasks;
             # serialize since http_req frames are handled on their own tasks.
             async with send_lock:
                 await ws.send(json.dumps(obj))
+
+        async def heartbeat_loop() -> None:
+            nonlocal pending_ping_id
+            while not self._stopping.is_set():
+                await asyncio.sleep(self._ping_interval)
+                if self._stopping.is_set():
+                    return
+
+                pending_ping_id = uuid.uuid4().hex
+                timestamp = int(time.time() * 1000)
+                pong_received.clear()
+                await send_frame(
+                    {
+                        "type": "ping",
+                        "id": pending_ping_id,
+                        "timestamp": timestamp,
+                    }
+                )
+                try:
+                    await asyncio.wait_for(
+                        pong_received.wait(),
+                        timeout=self._ping_timeout,
+                    )
+                except asyncio.TimeoutError:
+                    heartbeat_timed_out.set()
+                    logger.warning(
+                        "TunnelClient application heartbeat timed out after %.1fs",
+                        self._ping_timeout,
+                    )
+                    await ws.close()
+                    return
 
         def cleanup_completed() -> None:
             now = time.monotonic()
@@ -457,7 +513,9 @@ class TunnelClient:
                                 data = upstream_message
                                 binary = False
                             else:
-                                data = base64.b64encode(upstream_message).decode("ascii")
+                                data = base64.b64encode(upstream_message).decode(
+                                    "ascii"
+                                )
                                 binary = True
                             await send_frame(
                                 {
@@ -523,6 +581,7 @@ class TunnelClient:
 
         limits = httpx.Limits(max_keepalive_connections=5, max_connections=10)
         tasks: set = set()
+        heartbeat_task = asyncio.create_task(heartbeat_loop())
         try:
             async with httpx.AsyncClient(
                 limits=limits,
@@ -563,11 +622,21 @@ class TunnelClient:
                                 "timestamp": frame.get("timestamp", 0),
                             }
                         )
+                    elif (
+                        ftype == "pong"
+                        and pending_ping_id is not None
+                        and frame.get("id") == pending_ping_id
+                    ):
+                        pong_received.set()
         except ws_exc.ConnectionClosed:
             pass
         finally:
+            heartbeat_task.cancel()
+            await asyncio.gather(heartbeat_task, return_exceptions=True)
             for task in list(tasks):
                 task.cancel()
             if tasks:
                 await asyncio.gather(*tasks, return_exceptions=True)
             ws_channels.clear()
+        if heartbeat_timed_out.is_set():
+            raise asyncio.TimeoutError("TunnelClient application heartbeat timed out")

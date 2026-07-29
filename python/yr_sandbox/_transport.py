@@ -20,7 +20,9 @@ Response format:
 
 import base64
 import json
+import logging
 import os
+import time
 import uuid
 from typing import Any, Dict, Iterable, Optional
 
@@ -30,16 +32,48 @@ import httpx
 from ._http_pool import acquire_shared_http_client
 from .types import YR_GET_DEFAULT_TIMEOUT, YR_GET_TIMEOUT_BUFFER
 
+logger = logging.getLogger(__name__)
+
 
 class SandboxError(RuntimeError):
     """Raised when the frontend returns a non-2xx response or an error body."""
 
 
-_SAFE_DIRECT_FALLBACK_ERRORS = (
+class _RetryableHTTPStatus(SandboxError):
+    """Transient gateway response whose create/delete outcome may be unknown."""
+
+
+_DIRECT_SAFE_FALLBACK_ERRORS = (
     httpx.ConnectError,
     httpx.ConnectTimeout,
     httpx.PoolTimeout,
 )
+_DIRECT_UNKNOWN_OUTCOME_ERRORS = (
+    httpx.ReadError,
+    httpx.ReadTimeout,
+    httpx.RemoteProtocolError,
+    httpx.WriteError,
+    httpx.WriteTimeout,
+)
+_DIRECT_MAX_ATTEMPTS = 3
+_DIRECT_RETRY_BACKOFF_SECONDS = 0.1
+_DIRECT_POOL_TIMEOUT_SECONDS = 2.0
+
+_CREATE_MAX_ATTEMPTS = 3
+_CREATE_RETRY_BACKOFF_SECONDS = 0.1
+_CREATE_RETRYABLE_ERRORS = (
+    httpx.ConnectError,
+    httpx.ConnectTimeout,
+    httpx.ReadError,
+    httpx.ReadTimeout,
+    httpx.RemoteProtocolError,
+    httpx.WriteError,
+    httpx.WriteTimeout,
+    _RetryableHTTPStatus,
+)
+_RETRYABLE_GATEWAY_STATUS_CODES = frozenset((502, 503, 504))
+_DELETE_MAX_ATTEMPTS = 3
+_DELETE_RETRY_BACKOFF_SECONDS = 0.1
 
 
 def _require_env(name: str) -> str:
@@ -142,20 +176,90 @@ class SandboxClient:
         """POST /sandboxes and return the confirmed-running final SSE result."""
         logical_timeout = int(body.get("createTimeoutSeconds") or 60)
         request_timeout = logical_timeout + YR_GET_TIMEOUT_BUFFER
+        # A UUIDv4 identifies this logical create across transport retries.
+        # Anonymous names are intentionally left to the receiving frontend:
+        # retries reaching another replica may create an extra sandbox, which
+        # server-side idle reclamation will collect.
+        operation_id = str(uuid.uuid4())
+        request_id = f"create-{operation_id}"
+        request_body = dict(body)
+        request_name = request_body.get("name") or "<frontend-generated>"
+        deadline = time.monotonic() + request_timeout
+        last_error: Optional[BaseException] = None
+        attempts = 0
+
+        for attempt in range(1, _CREATE_MAX_ATTEMPTS + 1):
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                break
+            attempts = attempt
+            try:
+                data = self._create_info_attempt(
+                    request_body,
+                    request_id=request_id,
+                    request_timeout=remaining,
+                )
+            except _CREATE_RETRYABLE_ERRORS as exc:
+                last_error = exc
+                if attempt >= _CREATE_MAX_ATTEMPTS:
+                    break
+                remaining = deadline - time.monotonic()
+                backoff = min(
+                    _CREATE_RETRY_BACKOFF_SECONDS * (2 ** (attempt - 1)),
+                    max(0.0, remaining),
+                )
+                if backoff <= 0:
+                    break
+                logger.warning(
+                    "sandbox create transport error; retrying "
+                    "request_id=%s name=%s attempt=%d/%d error=%s",
+                    request_id,
+                    request_name,
+                    attempt,
+                    _CREATE_MAX_ATTEMPTS,
+                    exc,
+                )
+                time.sleep(backoff)
+                continue
+
+            self._last_create = data
+            return data
+
+        raise SandboxError(
+            "sandbox create transport failed after "
+            f"{attempts} attempts "
+            f"(requestId={request_id}, name={request_name}): "
+            f"{last_error or 'create deadline exhausted'}"
+        ) from last_error
+
+    def _create_info_attempt(
+        self,
+        body: Dict[str, Any],
+        *,
+        request_id: str,
+        request_timeout: float,
+    ) -> Dict[str, Any]:
+        """Execute one transport attempt for a logical sandbox create."""
         final: Optional[Dict[str, Any]] = None
         with self._http.stream(
             "POST",
             f"{self._base}/sandboxes",
             json=body,
-            headers={"Accept": "text/event-stream"},
+            headers={
+                "Accept": "text/event-stream",
+                "X-Request-Id": request_id,
+            },
             timeout=request_timeout,
         ) as resp:
+            if resp.status_code in _RETRYABLE_GATEWAY_STATUS_CODES:
+                resp.read()
+                raise _RetryableHTTPStatus(
+                    f"HTTP {resp.status_code}: {resp.text}"
+                )
             content_type = resp.headers.get("content-type", "").lower()
             if "text/event-stream" not in content_type:
                 resp.read()
-                data = self._json(resp)
-                self._last_create = data
-                return data
+                return self._json(resp)
             if resp.status_code >= 400:
                 resp.read()
                 raise SandboxError(f"HTTP {resp.status_code}: {resp.text}")
@@ -193,11 +297,14 @@ class SandboxClient:
             status = final.get("status") or "unknown"
             code = final.get("errorCode")
             message = final.get("message") or "sandbox did not reach running state"
+            response_request_id = final.get("requestId") or request_id
+            sandbox_id = final.get("sandboxId") or final.get("instanceId") or "unknown"
             raise SandboxError(
-                f"sandbox create {status} (errorCode={code}): {message}"
+                f"sandbox create {status} "
+                f"(errorCode={code}, requestId={response_request_id}, "
+                f"sandboxId={sandbox_id}): {message}"
             )
         data = final
-        self._last_create = data
         return data
 
     @property
@@ -207,12 +314,48 @@ class SandboxClient:
 
     def delete(self, sandbox_id: str) -> None:
         """DELETE /sandboxes/{id}."""
-        resp = self._http.delete(f"{self._base}/sandboxes/{sandbox_id}", timeout=60)
-        # Treat 404 as a successful idempotent teardown.
-        if resp.status_code not in (200, 202, 204, 404):
-            raise SandboxError(
-                f"delete {sandbox_id} failed: HTTP {resp.status_code} {resp.text}"
+        request_id = f"delete-{uuid.uuid4()}"
+        last_error: Optional[BaseException] = None
+        for attempt in range(1, _DELETE_MAX_ATTEMPTS + 1):
+            try:
+                resp = self._http.delete(
+                    f"{self._base}/sandboxes/{sandbox_id}",
+                    headers={"X-Request-Id": request_id},
+                    timeout=60,
+                )
+            except _CREATE_RETRYABLE_ERRORS as exc:
+                last_error = exc
+            else:
+                # Treat 404 as a successful idempotent teardown.
+                if resp.status_code in (200, 202, 204, 404):
+                    return
+                if resp.status_code not in _RETRYABLE_GATEWAY_STATUS_CODES:
+                    raise SandboxError(
+                        f"delete {sandbox_id} failed "
+                        f"(requestId={request_id}, attempt={attempt}): "
+                        f"HTTP {resp.status_code} {resp.text}"
+                    )
+                last_error = _RetryableHTTPStatus(
+                    f"HTTP {resp.status_code}: {resp.text}"
+                )
+
+            if attempt >= _DELETE_MAX_ATTEMPTS:
+                break
+            logger.warning(
+                "sandbox delete transport error; retrying "
+                "request_id=%s sandbox_id=%s attempt=%d/%d error=%s",
+                request_id,
+                sandbox_id,
+                attempt,
+                _DELETE_MAX_ATTEMPTS,
+                last_error,
             )
+            time.sleep(_DELETE_RETRY_BACKOFF_SECONDS * (2 ** (attempt - 1)))
+
+        raise SandboxError(
+            f"delete {sandbox_id} failed after {_DELETE_MAX_ATTEMPTS} attempts "
+            f"(requestId={request_id}): {last_error}"
+        ) from last_error
 
     def instance_info(self, sandbox_id: str) -> Dict[str, Any]:
         """Return one instance summary from the existing frontend watcher API."""
@@ -266,6 +409,11 @@ class SandboxClient:
             rpc_timeout = max(timeout + YR_GET_TIMEOUT_BUFFER, YR_GET_DEFAULT_TIMEOUT)
 
         request_id = self._new_request_id("invoke")
+        deadline = (
+            None
+            if rpc_timeout is None
+            else time.monotonic() + rpc_timeout
+        )
 
         # Prefer frontend /direct; fall back to frontend invoke.
         if self._direct_enabled and not self._direct_disabled:
@@ -273,12 +421,18 @@ class SandboxClient:
                 sandbox_id,
                 action,
                 args or {},
-                rpc_timeout,
                 request_id,
+                deadline,
             )
             if not fell_back:
                 return result
 
+        fallback_timeout = self._remaining_timeout(deadline)
+        if fallback_timeout is not None and fallback_timeout <= 0:
+            raise SandboxError(
+                "invoke deadline exhausted before frontend fallback "
+                f"(requestId={request_id})"
+            )
         resp = self._http.post(
             f"{self._base}/sandboxes/{sandbox_id}/invoke",
             json={
@@ -286,7 +440,7 @@ class SandboxClient:
                 "args": args or {},
                 "requestId": request_id,
             },
-            timeout=rpc_timeout,
+            timeout=fallback_timeout,
             headers={"X-YR-Request-ID": request_id},
         )
         return self._json(resp)
@@ -296,62 +450,125 @@ class SandboxClient:
         sandbox_id: str,
         action: str,
         args: Dict[str, Any],
-        rpc_timeout: Optional[float],
         request_id: str,
+        deadline: Optional[float],
     ) -> "tuple[Dict[str, Any], bool]":
         """Try the frontend /direct path. Returns ``(result, fell_back)``.
 
-        ``fell_back=True`` is returned only when the request is known not to
-        have reached RRT (connect/pool failure) or when frontend reports that
-        the direct route does not exist. Failures after request transmission
-        have an unknown execution outcome and must not retry side effects.
-        Unlike frontend invoke, the RRT HTTP server returns the raw result JSON
-        (no base64 ``BuildJobResponse`` envelope); action-level errors live
-        inside that object (HTTP 200).
+        All attempts for one logical action reuse ``request_id``. RRT deduplicates
+        direct requests by that id, so a retry can wait for or replay the first
+        execution instead of repeating a side effect. ``fell_back=True`` is
+        returned only after connect/pool failures (known not sent) are exhausted,
+        or when frontend reports that the direct route does not exist. An
+        exhausted unknown-outcome failure is surfaced to the caller and is never
+        replayed through RuntimeRPC.
+
+        Unlike frontend invoke, the RRT HTTP server returns raw result JSON (no
+        base64 ``BuildJobResponse`` envelope); action-level errors live inside
+        that object (HTTP 200).
         """
         url = f"{self._direct_base}/{self._safe_id(sandbox_id)}/invoke"
-        try:
-            resp = self._http.post(
-                url,
-                json={"action": action, "args": args, "requestId": request_id},
-                timeout=rpc_timeout,
-                headers={"X-YR-Request-ID": request_id},
+        last_error: Optional[BaseException] = None
+        last_failure_safe = False
+        attempts = 0
+
+        for attempt in range(1, _DIRECT_MAX_ATTEMPTS + 1):
+            remaining = self._remaining_timeout(deadline)
+            if remaining is not None and remaining <= 0:
+                break
+            attempts = attempt
+            pool_timeout = (
+                _DIRECT_POOL_TIMEOUT_SECONDS
+                if remaining is None
+                else min(_DIRECT_POOL_TIMEOUT_SECONDS, remaining)
             )
-        except _SAFE_DIRECT_FALLBACK_ERRORS:
+            request_timeout = httpx.Timeout(
+                remaining,
+                pool=pool_timeout,
+            )
+            try:
+                resp = self._http.post(
+                    url,
+                    json={
+                        "action": action,
+                        "args": args,
+                        "requestId": request_id,
+                    },
+                    timeout=request_timeout,
+                    headers={"X-YR-Request-ID": request_id},
+                )
+            except _DIRECT_SAFE_FALLBACK_ERRORS as exc:
+                last_error = exc
+                last_failure_safe = True
+            except _DIRECT_UNKNOWN_OUTCOME_ERRORS as exc:
+                last_error = exc
+                last_failure_safe = False
+            except httpx.RequestError as exc:
+                raise SandboxError(
+                    "direct invoke outcome is unknown after transport failure "
+                    f"(requestId={request_id}): {exc}"
+                ) from exc
+            else:
+                if resp.status_code == 404:
+                    self._direct_disabled = True
+                    return {}, True
+                if resp.status_code in _RETRYABLE_GATEWAY_STATUS_CODES:
+                    last_error = _RetryableHTTPStatus(
+                        f"HTTP {resp.status_code}: {resp.text}"
+                    )
+                    last_failure_safe = False
+                elif resp.status_code >= 400:
+                    raise SandboxError(
+                        f"direct invoke failed: HTTP {resp.status_code} "
+                        f"(requestId={request_id}): {resp.text}"
+                    )
+                else:
+                    try:
+                        parsed = resp.json()
+                    except ValueError as exc:
+                        last_error = SandboxError(
+                            f"direct invoke returned invalid JSON: {exc}"
+                        )
+                        last_failure_safe = False
+                    else:
+                        if not isinstance(parsed, dict):
+                            parsed = {"value": parsed}
+                        return parsed, False
+
+            if attempt >= _DIRECT_MAX_ATTEMPTS:
+                break
+            remaining = self._remaining_timeout(deadline)
+            backoff = _DIRECT_RETRY_BACKOFF_SECONDS * (2 ** (attempt - 1))
+            if remaining is not None:
+                backoff = min(backoff, max(0.0, remaining))
+            if backoff <= 0:
+                break
+            logger.warning(
+                "direct invoke transport error; retrying "
+                "request_id=%s action=%s attempt=%d/%d error=%s",
+                request_id,
+                action,
+                attempt,
+                _DIRECT_MAX_ATTEMPTS,
+                last_error,
+            )
+            time.sleep(backoff)
+
+        if last_failure_safe and last_error is not None:
             # No connection was established and no request bytes reached RRT.
             self._direct_disabled = True
             return {}, True
-        except httpx.RequestError as exc:
-            self._direct_disabled = True
-            raise SandboxError(
-                "direct invoke outcome is unknown after transport failure "
-                f"(requestId={request_id}): {exc}"
-            ) from exc
-        if resp.status_code == 404:
-            self._direct_disabled = True
-            return {}, True
-        if resp.status_code >= 500:
-            self._direct_disabled = True
-            raise SandboxError(
-                "direct invoke outcome is unknown after "
-                f"HTTP {resp.status_code} (requestId={request_id}): {resp.text}"
-            )
-        if resp.status_code >= 400:
-            raise SandboxError(
-                f"direct invoke failed: HTTP {resp.status_code} "
-                f"(requestId={request_id}): {resp.text}"
-            )
-        try:
-            parsed = resp.json()
-        except ValueError as exc:
-            self._direct_disabled = True
-            raise SandboxError(
-                "direct invoke returned invalid JSON; outcome is unknown "
-                f"(requestId={request_id})"
-            ) from exc
-        if not isinstance(parsed, dict):
-            parsed = {"value": parsed}
-        return parsed, False
+        detail = last_error or "invoke deadline exhausted"
+        raise SandboxError(
+            "direct invoke outcome is unknown after "
+            f"{attempts} attempts (requestId={request_id}): {detail}"
+        ) from last_error
+
+    @staticmethod
+    def _remaining_timeout(deadline: Optional[float]) -> Optional[float]:
+        if deadline is None:
+            return None
+        return max(0.0, deadline - time.monotonic())
 
     def upload_file_direct(
         self,

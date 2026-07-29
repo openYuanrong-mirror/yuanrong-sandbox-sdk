@@ -26,8 +26,8 @@ class _FakeClient:
         if action == "process.list":
             return {
                 "processes": [
-                    {"pid": 7, "cmd": "sleep 1", "status": "running"},
-                    {"pid": 8, "cmd": "true", "status": "done"},
+                    {"pid": 7, "cmd": "sleep 1", "running": True},
+                    {"pid": 8, "cmd": "true", "running": False},
                 ]
             }
         if action in ("shell.create", "shell.close"):
@@ -117,10 +117,26 @@ class SDKContractTests(unittest.TestCase):
             ],
         )
 
-    def test_commands_list_returns_akernel_command_info(self):
+    def test_commands_list_reads_rrt_running_field(self):
         client = _FakeClient()
         processes = Commands(client, "sandbox-1").list()
         self.assertEqual(processes[0].command, "sleep 1")
+        self.assertTrue(processes[0].running)
+        self.assertFalse(processes[1].running)
+
+    def test_commands_list_accepts_legacy_status_field(self):
+        class _LegacyClient(_FakeClient):
+            def invoke(self, sandbox_id, action, args, **kwargs):
+                if action == "process.list":
+                    return {
+                        "processes": [
+                            {"pid": 7, "cmd": "sleep 1", "status": "running"},
+                            {"pid": 8, "cmd": "true", "status": "done"},
+                        ]
+                    }
+                return super().invoke(sandbox_id, action, args, **kwargs)
+
+        processes = Commands(_LegacyClient(), "sandbox-1").list()
         self.assertTrue(processes[0].running)
         self.assertFalse(processes[1].running)
 
