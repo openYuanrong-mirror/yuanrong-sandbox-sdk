@@ -210,11 +210,14 @@ class Commands:
         for item in processes:
             if not isinstance(item, dict):
                 continue
+            running = item.get("running")
+            if not isinstance(running, bool):
+                running = item.get("status") == "running"
             out.append(
                 CommandInfo(
                     pid=int(item.get("pid", 0)),
                     command=str(item.get("cmd", "")),
-                    running=item.get("status") == "running",
+                    running=running,
                 )
             )
         return out
