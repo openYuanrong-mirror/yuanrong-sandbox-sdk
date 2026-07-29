@@ -131,6 +131,120 @@ def test_create_rejects_stream_without_final():
     print("ok: create rejects stream without final")
 
 
+def test_create_retries_broken_sse_with_stable_request_identity():
+    attempts = []
+
+    class BrokenCreateStream(httpx.SyncByteStream):
+        def __iter__(self):
+            yield (
+                b'event: accepted\n'
+                b'data: {"status":"creating"}\n\n'
+            )
+            raise httpx.ReadError("connection reset during chunked response")
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        attempts.append(
+            {
+                "request_id": request.headers.get("X-Request-Id"),
+                "body": json.loads(request.read()),
+            }
+        )
+        if len(attempts) == 1:
+            return httpx.Response(
+                200,
+                headers={"content-type": "text/event-stream"},
+                stream=BrokenCreateStream(),
+            )
+        return httpx.Response(
+            200,
+            headers={"content-type": "text/event-stream"},
+            text=(
+                'event: final\n'
+                'data: {"sandboxId":"sandbox-retried","status":"running"}\n\n'
+            ),
+        )
+
+    c = _make_client(handler)
+    result = c.create_info({"createTimeoutSeconds": 3})
+
+    _check(result["sandboxId"] == "sandbox-retried", f"create result: {result}")
+    _check(len(attempts) == 2, f"create attempts: {attempts}")
+    _check(
+        attempts[0]["request_id"] == attempts[1]["request_id"],
+        f"request id changed across retries: {attempts}",
+    )
+    _check(
+        attempts[0]["body"]["name"] == attempts[1]["body"]["name"],
+        f"sandbox name changed across retries: {attempts}",
+    )
+    _check(
+        attempts[0]["body"]["name"].startswith("sandbox-"),
+        f"generated sandbox name missing: {attempts}",
+    )
+    print("ok: broken create SSE retries with stable request identity")
+
+
+def test_create_transport_retry_is_bounded_and_preserves_user_name():
+    attempts = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        attempts.append(
+            {
+                "request_id": request.headers.get("X-Request-Id"),
+                "body": json.loads(request.read()),
+            }
+        )
+        raise httpx.ConnectError("connection reset", request=request)
+
+    c = _make_client(handler)
+    try:
+        c.create_info(
+            {
+                "name": "user-sandbox",
+                "createTimeoutSeconds": 3,
+            }
+        )
+    except SandboxError as exc:
+        _check("transport failed after 3 attempts" in str(exc), f"error: {exc}")
+        _check(
+            f"requestId={attempts[0]['request_id']}" in str(exc),
+            f"request id missing: {exc}",
+        )
+        _check("name=user-sandbox" in str(exc), f"name missing: {exc}")
+    else:
+        raise AssertionError("persistent create transport failure must raise")
+
+    _check(len(attempts) == 3, f"create attempts: {attempts}")
+    _check(
+        len({item["request_id"] for item in attempts}) == 1,
+        f"request id changed across retries: {attempts}",
+    )
+    _check(
+        {item["body"]["name"] for item in attempts} == {"user-sandbox"},
+        f"user name changed across retries: {attempts}",
+    )
+    print("ok: create transport retries are bounded")
+
+
+def test_create_http_error_is_not_retried():
+    attempts = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        attempts.append(request.headers.get("X-Request-Id"))
+        return httpx.Response(409, json={"message": "request body conflict"})
+
+    c = _make_client(handler)
+    try:
+        c.create_info({"createTimeoutSeconds": 3})
+    except SandboxError as exc:
+        _check("HTTP 409" in str(exc), f"unexpected HTTP error: {exc}")
+    else:
+        raise AssertionError("HTTP create error must raise")
+
+    _check(len(attempts) == 1, f"HTTP error was retried: {attempts}")
+    print("ok: create HTTP errors are not retried")
+
+
 def test_sandbox_create_timeout_precedence_and_body():
     import yr_sandbox.sandbox_api as sandbox_api
 

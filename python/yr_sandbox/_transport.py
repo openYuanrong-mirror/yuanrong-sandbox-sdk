@@ -20,7 +20,9 @@ Response format:
 
 import base64
 import json
+import logging
 import os
+import time
 import uuid
 from typing import Any, Dict, Iterable, Optional
 
@@ -29,6 +31,8 @@ import httpx
 # Default per-call timeout buffer, mirroring types.YR_GET_TIMEOUT_BUFFER.
 from ._http_pool import acquire_shared_http_client
 from .types import YR_GET_DEFAULT_TIMEOUT, YR_GET_TIMEOUT_BUFFER
+
+logger = logging.getLogger(__name__)
 
 
 class SandboxError(RuntimeError):
@@ -39,6 +43,18 @@ _SAFE_DIRECT_FALLBACK_ERRORS = (
     httpx.ConnectError,
     httpx.ConnectTimeout,
     httpx.PoolTimeout,
+)
+
+_CREATE_MAX_ATTEMPTS = 3
+_CREATE_RETRY_BACKOFF_SECONDS = 0.1
+_CREATE_RETRYABLE_ERRORS = (
+    httpx.ConnectError,
+    httpx.ConnectTimeout,
+    httpx.ReadError,
+    httpx.ReadTimeout,
+    httpx.RemoteProtocolError,
+    httpx.WriteError,
+    httpx.WriteTimeout,
 )
 
 
@@ -142,7 +158,66 @@ class SandboxClient:
         """POST /sandboxes and return the confirmed-running final SSE result."""
         logical_timeout = int(body.get("createTimeoutSeconds") or 60)
         request_timeout = logical_timeout + YR_GET_TIMEOUT_BUFFER
-        request_id = self._new_request_id("create")
+        operation_id = str(uuid.uuid4())
+        request_id = f"create-{operation_id}"
+        request_body = dict(body)
+        request_body.setdefault("name", f"sandbox-{operation_id}")
+        deadline = time.monotonic() + request_timeout
+        last_error: Optional[BaseException] = None
+        attempts = 0
+
+        for attempt in range(1, _CREATE_MAX_ATTEMPTS + 1):
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                break
+            attempts = attempt
+            try:
+                data = self._create_info_attempt(
+                    request_body,
+                    request_id=request_id,
+                    request_timeout=remaining,
+                )
+            except _CREATE_RETRYABLE_ERRORS as exc:
+                last_error = exc
+                if attempt >= _CREATE_MAX_ATTEMPTS:
+                    break
+                remaining = deadline - time.monotonic()
+                backoff = min(
+                    _CREATE_RETRY_BACKOFF_SECONDS * (2 ** (attempt - 1)),
+                    max(0.0, remaining),
+                )
+                if backoff <= 0:
+                    break
+                logger.warning(
+                    "sandbox create transport error; retrying "
+                    "request_id=%s name=%s attempt=%d/%d error=%s",
+                    request_id,
+                    request_body["name"],
+                    attempt,
+                    _CREATE_MAX_ATTEMPTS,
+                    exc,
+                )
+                time.sleep(backoff)
+                continue
+
+            self._last_create = data
+            return data
+
+        raise SandboxError(
+            "sandbox create transport failed after "
+            f"{attempts} attempts "
+            f"(requestId={request_id}, name={request_body['name']}): "
+            f"{last_error or 'create deadline exhausted'}"
+        ) from last_error
+
+    def _create_info_attempt(
+        self,
+        body: Dict[str, Any],
+        *,
+        request_id: str,
+        request_timeout: float,
+    ) -> Dict[str, Any]:
+        """Execute one transport attempt for a logical sandbox create."""
         final: Optional[Dict[str, Any]] = None
         with self._http.stream(
             "POST",
@@ -157,9 +232,7 @@ class SandboxClient:
             content_type = resp.headers.get("content-type", "").lower()
             if "text/event-stream" not in content_type:
                 resp.read()
-                data = self._json(resp)
-                self._last_create = data
-                return data
+                return self._json(resp)
             if resp.status_code >= 400:
                 resp.read()
                 raise SandboxError(f"HTTP {resp.status_code}: {resp.text}")
@@ -205,7 +278,6 @@ class SandboxClient:
                 f"sandboxId={sandbox_id}): {message}"
             )
         data = final
-        self._last_create = data
         return data
 
     @property
