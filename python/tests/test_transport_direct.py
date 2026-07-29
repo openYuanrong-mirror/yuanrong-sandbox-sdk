@@ -16,6 +16,7 @@ import os
 import tarfile
 import tempfile
 import urllib.request
+import uuid
 from pathlib import Path
 
 import httpx
@@ -243,6 +244,48 @@ def test_create_http_error_is_not_retried():
 
     _check(len(attempts) == 1, f"HTTP error was retried: {attempts}")
     print("ok: create HTTP errors are not retried")
+
+
+def test_distinct_logical_creates_use_distinct_full_uuid_names():
+    attempts = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        body = json.loads(request.read())
+        attempts.append(
+            {
+                "request_id": request.headers.get("X-Request-Id"),
+                "name": body["name"],
+            }
+        )
+        return httpx.Response(
+            200,
+            headers={"content-type": "text/event-stream"},
+            text=(
+                'event: final\n'
+                f'data: {{"sandboxId":"{body["name"]}","status":"running"}}\n\n'
+            ),
+        )
+
+    c = _make_client(handler)
+    c.create_info({"createTimeoutSeconds": 3})
+    c.create_info({"createTimeoutSeconds": 3})
+
+    _check(len(attempts) == 2, f"create attempts: {attempts}")
+    _check(
+        attempts[0]["name"] != attempts[1]["name"],
+        f"logical creates reused a name: {attempts}",
+    )
+    for attempt in attempts:
+        operation_id = attempt["request_id"].removeprefix("create-")
+        _check(
+            attempt["name"] == f"sandbox-{operation_id}",
+            f"name and request id do not share the logical operation id: {attempt}",
+        )
+        _check(
+            uuid.UUID(operation_id).version == 4,
+            f"create identity is not a full UUIDv4: {attempt}",
+        )
+    print("ok: distinct logical creates use distinct full UUID names")
 
 
 def test_sandbox_create_timeout_precedence_and_body():

@@ -158,6 +158,8 @@ class SandboxClient:
         """POST /sandboxes and return the confirmed-running final SSE result."""
         logical_timeout = int(body.get("createTimeoutSeconds") or 60)
         request_timeout = logical_timeout + YR_GET_TIMEOUT_BUFFER
+        # One UUIDv4 supplies 122 random bits for the logical create identity.
+        # Reusing it for both fields keeps retries stable without shortening it.
         operation_id = str(uuid.uuid4())
         request_id = f"create-{operation_id}"
         request_body = dict(body)
