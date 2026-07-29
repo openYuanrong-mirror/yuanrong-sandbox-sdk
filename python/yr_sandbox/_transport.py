@@ -142,12 +142,16 @@ class SandboxClient:
         """POST /sandboxes and return the confirmed-running final SSE result."""
         logical_timeout = int(body.get("createTimeoutSeconds") or 60)
         request_timeout = logical_timeout + YR_GET_TIMEOUT_BUFFER
+        request_id = self._new_request_id("create")
         final: Optional[Dict[str, Any]] = None
         with self._http.stream(
             "POST",
             f"{self._base}/sandboxes",
             json=body,
-            headers={"Accept": "text/event-stream"},
+            headers={
+                "Accept": "text/event-stream",
+                "X-Request-Id": request_id,
+            },
             timeout=request_timeout,
         ) as resp:
             content_type = resp.headers.get("content-type", "").lower()
@@ -193,8 +197,12 @@ class SandboxClient:
             status = final.get("status") or "unknown"
             code = final.get("errorCode")
             message = final.get("message") or "sandbox did not reach running state"
+            response_request_id = final.get("requestId") or request_id
+            sandbox_id = final.get("sandboxId") or final.get("instanceId") or "unknown"
             raise SandboxError(
-                f"sandbox create {status} (errorCode={code}): {message}"
+                f"sandbox create {status} "
+                f"(errorCode={code}, requestId={response_request_id}, "
+                f"sandboxId={sandbox_id}): {message}"
             )
         data = final
         self._last_create = data

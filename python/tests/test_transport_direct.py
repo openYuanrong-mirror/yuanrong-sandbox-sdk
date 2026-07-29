@@ -78,7 +78,10 @@ def test_create_uses_sse_and_returns_running_final():
 
 
 def test_create_rejects_timeout_final():
-    def handler(_request: httpx.Request) -> httpx.Response:
+    seen = {}
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        seen["request_id"] = request.headers.get("X-Request-Id")
         return httpx.Response(
             200,
             headers={"content-type": "text/event-stream"},
@@ -97,6 +100,14 @@ def test_create_rejects_timeout_final():
     except SandboxError as exc:
         _check("create timed out" in str(exc), f"timeout error: {exc}")
         _check("3002" in str(exc), f"timeout code missing: {exc}")
+        _check(
+            f"requestId={seen['request_id']}" in str(exc),
+            f"request id missing: {exc}",
+        )
+        _check(
+            "sandboxId=sandbox-timeout" in str(exc),
+            f"sandbox id missing: {exc}",
+        )
     else:
         raise AssertionError("timeout final must raise SandboxError")
     print("ok: create rejects timeout final")
