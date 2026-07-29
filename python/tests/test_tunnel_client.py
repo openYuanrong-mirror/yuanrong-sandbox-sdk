@@ -50,6 +50,7 @@ class _FrameWebSocket:
     def __init__(self):
         self._incoming = asyncio.Queue()
         self.sent = asyncio.Queue()
+        self.closed = asyncio.Event()
 
     def __aiter__(self):
         return self
@@ -62,6 +63,10 @@ class _FrameWebSocket:
 
     async def send(self, message):
         await self.sent.put(json.loads(message))
+
+    async def close(self):
+        self.closed.set()
+        self.close_input()
 
     def feed(self, frame):
         self._incoming.put_nowait(frame)
@@ -234,6 +239,56 @@ class TunnelClientRequestTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(headers.get("Cookie"), "caller=explicit")
 
 
+class TunnelClientHeartbeatTests(unittest.IsolatedAsyncioTestCase):
+    async def test_sends_application_ping_and_accepts_matching_pong(self):
+        websocket = _FrameWebSocket()
+        client = TunnelClient(
+            upstream="127.0.0.1:1",
+            ping_interval=0.01,
+            ping_timeout=0.5,
+        )
+
+        proxy_task = asyncio.create_task(client._proxy_loop(websocket))
+        ping = await asyncio.wait_for(websocket.sent.get(), timeout=1)
+        self.assertEqual(ping["type"], "ping")
+        self.assertTrue(ping["id"])
+        self.assertIsInstance(ping["timestamp"], int)
+
+        websocket.feed(
+            {
+                "type": "pong",
+                "id": ping["id"],
+                "timestamp": ping["timestamp"],
+            }
+        )
+        client._stopping.set()
+        websocket.close_input()
+        await asyncio.wait_for(proxy_task, timeout=1)
+        self.assertFalse(websocket.closed.is_set())
+
+    async def test_missing_application_pong_closes_connection(self):
+        websocket = _FrameWebSocket()
+        client = TunnelClient(
+            upstream="127.0.0.1:1",
+            ping_interval=0.01,
+            ping_timeout=0.02,
+        )
+
+        proxy_task = asyncio.create_task(client._proxy_loop(websocket))
+        ping = await asyncio.wait_for(websocket.sent.get(), timeout=1)
+        self.assertEqual(ping["type"], "ping")
+        websocket.feed(
+            {
+                "type": "pong",
+                "id": "different-ping",
+                "timestamp": ping["timestamp"],
+            }
+        )
+        await asyncio.wait_for(websocket.closed.wait(), timeout=1)
+        with self.assertRaisesRegex(asyncio.TimeoutError, "heartbeat"):
+            await asyncio.wait_for(proxy_task, timeout=1)
+
+
 class TunnelClientTlsTests(unittest.IsolatedAsyncioTestCase):
     @staticmethod
     def _rejected_connection(client, status_code):
@@ -358,6 +413,8 @@ class TunnelClientTlsTests(unittest.IsolatedAsyncioTestCase):
         self.assertIsInstance(context, ssl.SSLContext)
         self.assertTrue(context.check_hostname)
         self.assertEqual(context.verify_mode, ssl.CERT_REQUIRED)
+        self.assertIsNone(captured["ping_interval"])
+        self.assertIsNone(captured["ping_timeout"])
 
     def test_wss_uses_explicit_ca_bundle(self):
         expected = ssl.create_default_context()
