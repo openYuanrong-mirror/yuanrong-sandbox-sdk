@@ -175,12 +175,8 @@ def test_create_retries_broken_sse_with_stable_request_identity():
         f"request id changed across retries: {attempts}",
     )
     _check(
-        attempts[0]["body"]["name"] == attempts[1]["body"]["name"],
-        f"sandbox name changed across retries: {attempts}",
-    )
-    _check(
-        attempts[0]["body"]["name"].startswith("sandbox-"),
-        f"generated sandbox name missing: {attempts}",
+        all("name" not in item["body"] for item in attempts),
+        f"anonymous create must leave name generation to frontend: {attempts}",
     )
     print("ok: broken create SSE retries with stable request identity")
 
@@ -246,7 +242,7 @@ def test_create_http_error_is_not_retried():
     print("ok: create HTTP errors are not retried")
 
 
-def test_distinct_logical_creates_use_distinct_full_uuid_names():
+def test_distinct_logical_creates_use_distinct_request_ids_without_names():
     attempts = []
 
     def handler(request: httpx.Request) -> httpx.Response:
@@ -254,7 +250,7 @@ def test_distinct_logical_creates_use_distinct_full_uuid_names():
         attempts.append(
             {
                 "request_id": request.headers.get("X-Request-Id"),
-                "name": body["name"],
+                "body": body,
             }
         )
         return httpx.Response(
@@ -262,7 +258,7 @@ def test_distinct_logical_creates_use_distinct_full_uuid_names():
             headers={"content-type": "text/event-stream"},
             text=(
                 'event: final\n'
-                f'data: {{"sandboxId":"{body["name"]}","status":"running"}}\n\n'
+                f'data: {{"sandboxId":"sandbox-{len(attempts)}","status":"running"}}\n\n'
             ),
         )
 
@@ -272,20 +268,113 @@ def test_distinct_logical_creates_use_distinct_full_uuid_names():
 
     _check(len(attempts) == 2, f"create attempts: {attempts}")
     _check(
-        attempts[0]["name"] != attempts[1]["name"],
-        f"logical creates reused a name: {attempts}",
+        attempts[0]["request_id"] != attempts[1]["request_id"],
+        f"logical creates reused a request id: {attempts}",
     )
     for attempt in attempts:
         operation_id = attempt["request_id"].removeprefix("create-")
         _check(
-            attempt["name"] == f"sandbox-{operation_id}",
-            f"name and request id do not share the logical operation id: {attempt}",
+            "name" not in attempt["body"],
+            f"anonymous create unexpectedly sent a name: {attempt}",
         )
         _check(
             uuid.UUID(operation_id).version == 4,
             f"create identity is not a full UUIDv4: {attempt}",
         )
-    print("ok: distinct logical creates use distinct full UUID names")
+    print("ok: distinct logical creates use distinct request ids without names")
+
+
+def test_create_retries_gateway_503_with_stable_request_id():
+    attempts = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        attempts.append(request.headers.get("X-Request-Id"))
+        if len(attempts) == 1:
+            return httpx.Response(503, text="upstream temporarily unavailable")
+        return httpx.Response(
+            200,
+            headers={"content-type": "text/event-stream"},
+            text=(
+                'event: final\n'
+                'data: {"sandboxId":"sandbox-after-503","status":"running"}\n\n'
+            ),
+        )
+
+    c = _make_client(handler)
+    result = c.create_info({"createTimeoutSeconds": 3})
+
+    _check(result["sandboxId"] == "sandbox-after-503", f"create result: {result}")
+    _check(len(attempts) == 2, f"create attempts: {attempts}")
+    _check(len(set(attempts)) == 1, f"request id changed across retry: {attempts}")
+    print("ok: create retries gateway 503 with stable request id")
+
+
+def test_delete_retries_transport_and_gateway_failures_with_stable_request_id():
+    attempts = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        attempts.append(request.headers.get("X-Request-Id"))
+        if len(attempts) == 1:
+            raise httpx.RemoteProtocolError(
+                "server disconnected without sending a response",
+                request=request,
+            )
+        if len(attempts) == 2:
+            return httpx.Response(502, text="bad gateway")
+        return httpx.Response(404, text="already deleted")
+
+    c = _make_client(handler)
+    c.delete("default-sandbox-delete")
+
+    _check(len(attempts) == 3, f"delete attempts: {attempts}")
+    _check(len(set(attempts)) == 1, f"delete request id changed: {attempts}")
+    _check(
+        attempts[0].startswith("delete-"),
+        f"delete request id missing operation prefix: {attempts}",
+    )
+    print("ok: delete retries transport and gateway failures")
+
+
+def test_delete_does_not_retry_non_transient_http_error():
+    attempts = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        attempts.append(request.headers.get("X-Request-Id"))
+        return httpx.Response(409, text="delete conflict")
+
+    c = _make_client(handler)
+    try:
+        c.delete("default-sandbox-conflict")
+    except SandboxError as exc:
+        _check("HTTP 409 delete conflict" in str(exc), f"delete error: {exc}")
+        _check("requestId=delete-" in str(exc), f"request id missing: {exc}")
+    else:
+        raise AssertionError("non-transient delete error must raise")
+
+    _check(len(attempts) == 1, f"non-transient delete was retried: {attempts}")
+    print("ok: delete does not retry non-transient HTTP errors")
+
+
+def test_delete_transport_retries_are_bounded_and_contextual():
+    attempts = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        attempts.append(request.headers.get("X-Request-Id"))
+        raise httpx.ConnectTimeout("TLS handshake timed out", request=request)
+
+    c = _make_client(handler)
+    try:
+        c.delete("default-sandbox-timeout")
+    except SandboxError as exc:
+        _check("failed after 3 attempts" in str(exc), f"attempts missing: {exc}")
+        _check("requestId=delete-" in str(exc), f"request id missing: {exc}")
+        _check("TLS handshake timed out" in str(exc), f"cause missing: {exc}")
+    else:
+        raise AssertionError("persistent delete transport failure must raise")
+
+    _check(len(attempts) == 3, f"delete attempts: {attempts}")
+    _check(len(set(attempts)) == 1, f"request id changed: {attempts}")
+    print("ok: delete transport retries are bounded and contextual")
 
 
 def test_sandbox_create_timeout_precedence_and_body():
@@ -392,7 +481,7 @@ def test_direct_success_no_fallback():
     print("ok: direct success, no fallback ->", calls)
 
 
-def test_direct_5xx_does_not_retry_current_invoke_and_sticks():
+def test_direct_503_retries_with_same_request_id():
     calls = []
 
     def handler(request: httpx.Request) -> httpx.Response:
@@ -405,44 +494,29 @@ def test_direct_5xx_does_not_retry_current_invoke_and_sticks():
             )
         )
         if request.url.path.startswith("/api/sandbox/v1"):
-            return httpx.Response(200, json=_envelope({"exists": True}))
-        return httpx.Response(503, json={"error": "route unavailable"})
+            raise AssertionError("retryable direct response must not use fallback")
+        if len(calls) < 3:
+            return httpx.Response(503, json={"error": "route unavailable"})
+        return httpx.Response(200, json={"created": True})
 
     c = _make_client(handler)
-    try:
-        c.invoke("sandbox-demo", "process.exec", {"cmd": ["touch", "/tmp/once"]})
-    except SandboxError as exc:
-        _check("outcome is unknown" in str(exc), f"unexpected 5xx error: {exc}")
-        _check(calls[0][1] in str(exc), f"request id missing from error: {exc}")
-    else:
-        raise AssertionError("5xx direct invoke must not retry through frontend")
+    out = c.invoke("sandbox-demo", "process.exec", {"cmd": ["touch", "/tmp/once"]})
+    _check(out == {"created": True}, f"retry result: {out}")
     _check(
-        calls == [
-            (
-                "/direct/sandbox-demo/invoke",
-                calls[0][1],
-                calls[0][1],
-            )
-        ],
-        f"current invoke must be sent once: {calls}",
-    )
-    _check(c._direct_disabled is True, "5xx should sticky-disable direct")
-
-    # A later logical invocation may use the fallback path.
-    out = c.invoke("sandbox-demo", "file.exists", {"path": "/"})
-    _check(out == {"exists": True}, f"later fallback result: {out}")
-    _check(
-        calls[1][0].startswith("/api/sandbox/v1"),
-        f"later call should skip direct: {calls}",
+        len(calls) == 3
+        and all(call[0] == "/direct/sandbox-demo/invoke" for call in calls),
+        f"expected three direct attempts: {calls}",
     )
     _check(
-        calls[1][1] == calls[1][2] and calls[1][1],
-        f"fallback request id should be observable: {calls}",
+        len({call[1] for call in calls}) == 1
+        and all(call[1] == call[2] for call in calls),
+        f"direct retries must reuse request id: {calls}",
     )
-    print("ok: 5xx is not retried; later invoke uses sticky fallback ->", calls)
+    _check(c._direct_disabled is False, "transient 503 must not disable direct")
+    print("ok: direct 503 retries with one request id ->", calls)
 
 
-def test_direct_read_timeout_does_not_retry_unknown_outcome():
+def test_direct_read_timeout_retries_with_same_request_id():
     calls = []
 
     def handler(request: httpx.Request) -> httpx.Response:
@@ -455,30 +529,72 @@ def test_direct_read_timeout_does_not_retry_unknown_outcome():
             )
         )
         if request.url.path.startswith("/api/sandbox/v1"):
-            return httpx.Response(200, json=_envelope({"ok": True}))
-        raise httpx.ReadTimeout(
-            "response lost after possible execution",
+            raise AssertionError("unknown-outcome retry must not use fallback")
+        if len(calls) == 1:
+            raise httpx.ReadTimeout(
+                "response lost after possible execution",
+                request=request,
+            )
+        return httpx.Response(200, json={"started": True})
+
+    c = _make_client(handler)
+    out = c.invoke("sandbox-demo", "process.start", {"cmd": ["side-effect"]})
+    _check(out == {"started": True}, f"retry result: {out}")
+    _check(
+        len(calls) == 2
+        and all(call[0] == "/direct/sandbox-demo/invoke" for call in calls),
+        f"read timeout should retry direct once: {calls}",
+    )
+    _check(
+        calls[0][1] == calls[0][2] == calls[1][1] == calls[1][2],
+        f"read timeout retry must reuse request id: {calls}",
+    )
+    _check(c._direct_disabled is False, "read timeout must not disable direct")
+    print("ok: direct read timeout retries with one request id ->", calls)
+
+
+def test_direct_unknown_outcome_retry_exhaustion_does_not_fallback():
+    calls = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        body = json.loads(request.content)
+        calls.append(
+            (
+                request.url.path,
+                request.headers.get("x-yr-request-id"),
+                body.get("requestId"),
+            )
+        )
+        if request.url.path.startswith("/api/sandbox/v1"):
+            raise AssertionError("unknown outcome must not use RuntimeRPC fallback")
+        raise httpx.RemoteProtocolError(
+            "server disconnected without a response",
             request=request,
         )
 
     c = _make_client(handler)
     try:
-        c.invoke("sandbox-demo", "process.start", {"cmd": ["side-effect"]})
+        c.invoke("sandbox-demo", "shell.run", {"command": "side-effect"})
     except SandboxError as exc:
-        _check("outcome is unknown" in str(exc), f"unexpected timeout error: {exc}")
+        _check("outcome is unknown" in str(exc), f"unexpected error: {exc}")
         _check(calls[0][1] in str(exc), f"request id missing from error: {exc}")
     else:
-        raise AssertionError("read timeout must not retry an unknown outcome")
+        raise AssertionError("exhausted unknown-outcome retries must fail")
+    _check(len(calls) == 3, f"expected three direct attempts: {calls}")
     _check(
-        len(calls) == 1 and calls[0][0] == "/direct/sandbox-demo/invoke",
-        f"read timeout retried the action: {calls}",
+        len({call[1] for call in calls}) == 1
+        and all(call[1] == call[2] for call in calls),
+        f"exhausted retries must reuse request id: {calls}",
     )
-    _check(c._direct_disabled is True, "read timeout should sticky-disable direct")
-    print("ok: read timeout does not retry unknown outcome ->", calls)
+    _check(
+        c._direct_disabled is False,
+        "unknown outcome must not permanently disable direct",
+    )
+    print("ok: exhausted unknown-outcome retries do not fall back ->", calls)
 
 
-def test_direct_4xx_does_not_fallback():
-    for status in (400, 401, 403, 409, 429):
+def test_direct_non_retryable_http_errors_do_not_fallback():
+    for status in (400, 401, 403, 409, 429, 500):
         calls = []
 
         def handler(
@@ -503,31 +619,41 @@ def test_direct_4xx_does_not_fallback():
             f"HTTP {status} retried through frontend: {calls}",
         )
         _check(c._direct_disabled is False, f"HTTP {status} should not disable direct")
-    print("ok: direct 4xx responses do not fall back")
+    print("ok: direct non-retryable HTTP responses do not fall back")
 
 
-def test_direct_invalid_json_does_not_retry_unknown_outcome():
+def test_direct_invalid_json_retries_with_same_request_id():
     calls = []
 
     def handler(request: httpx.Request) -> httpx.Response:
-        calls.append(request.url.path)
+        body = json.loads(request.content)
+        calls.append(
+            (
+                request.url.path,
+                request.headers.get("x-yr-request-id"),
+                body.get("requestId"),
+            )
+        )
         if request.url.path.startswith("/api/sandbox/v1"):
-            return httpx.Response(200, json=_envelope({"ok": True}))
-        return httpx.Response(200, content=b"not-json")
+            raise AssertionError("invalid direct response must not use fallback")
+        if len(calls) == 1:
+            return httpx.Response(200, content=b"not-json")
+        return httpx.Response(200, json={"ok": True})
 
     c = _make_client(handler)
-    try:
-        c.invoke("sandbox-demo", "process.exec", {"cmd": ["side-effect"]})
-    except SandboxError as exc:
-        _check("invalid JSON" in str(exc), f"unexpected invalid JSON error: {exc}")
-    else:
-        raise AssertionError("invalid direct response must not retry")
+    out = c.invoke("sandbox-demo", "process.exec", {"cmd": ["side-effect"]})
+    _check(out == {"ok": True}, f"invalid JSON retry result: {out}")
     _check(
-        calls == ["/direct/sandbox-demo/invoke"],
-        f"invalid direct response retried through frontend: {calls}",
+        len(calls) == 2
+        and all(call[0] == "/direct/sandbox-demo/invoke" for call in calls),
+        f"invalid response should retry direct: {calls}",
     )
-    _check(c._direct_disabled is True, "invalid response should disable direct")
-    print("ok: invalid direct response does not retry unknown outcome")
+    _check(
+        calls[0][1] == calls[0][2] == calls[1][1] == calls[1][2],
+        f"invalid response retry must reuse request id: {calls}",
+    )
+    _check(c._direct_disabled is False, "invalid response must not disable direct")
+    print("ok: invalid direct response retries with one request id ->", calls)
 
 
 def test_direct_connect_error_falls_back():
@@ -551,15 +677,57 @@ def test_direct_connect_error_falls_back():
     _check(out == {"ok": 1}, f"connect-error fallback: {out}")
     _check(c._direct_disabled is True, "connect error should sticky-disable")
     _check(
-        calls[0][0] == "/direct/sandbox-demo/invoke",
-        f"first call direct: {calls}",
+        len(calls) == 4
+        and all(
+            call[0] == "/direct/sandbox-demo/invoke"
+            for call in calls[:3]
+        ),
+        f"connect error should retry direct three times: {calls}",
     )
-    _check(calls[1][0].startswith("/api/sandbox/v1"), f"fallback: {calls}")
+    _check(calls[3][0].startswith("/api/sandbox/v1"), f"fallback: {calls}")
     _check(
-        calls[0][1] == calls[0][2] == calls[1][1] == calls[1][2],
+        len({call[1] for call in calls}) == 1
+        and all(call[1] == call[2] for call in calls),
         f"fallback must reuse the logical request id: {calls}",
     )
     print("ok: connect-error fallback ->", calls)
+
+
+def test_direct_pool_timeout_retries_then_falls_back():
+    calls = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        body = json.loads(request.content)
+        calls.append(
+            (
+                request.url.path,
+                request.headers.get("x-yr-request-id"),
+                body.get("requestId"),
+            )
+        )
+        if request.url.path.startswith("/api/sandbox/v1"):
+            return httpx.Response(200, json=_envelope({"ok": 1}))
+        raise httpx.PoolTimeout("connection pool exhausted", request=request)
+
+    c = _make_client(handler)
+    out = c.invoke("sandbox-demo", "file.exists", {"path": "/"})
+    _check(out == {"ok": 1}, f"pool-timeout fallback: {out}")
+    _check(c._direct_disabled is True, "pool timeout should sticky-disable")
+    _check(
+        len(calls) == 4
+        and all(
+            call[0] == "/direct/sandbox-demo/invoke"
+            for call in calls[:3]
+        )
+        and calls[3][0].startswith("/api/sandbox/v1"),
+        f"pool timeout retry/fallback calls: {calls}",
+    )
+    _check(
+        len({call[1] for call in calls}) == 1
+        and all(call[1] == call[2] for call in calls),
+        f"pool-timeout fallback must reuse request id: {calls}",
+    )
+    print("ok: pool timeout retries then falls back ->", calls)
 
 
 def test_direct_fallback_when_frontend_direct_missing():
@@ -1240,11 +1408,13 @@ if __name__ == "__main__":
     test_sandbox_create_timeout_precedence_and_body()
     test_sandbox_create_timeout_validation()
     test_direct_success_no_fallback()
-    test_direct_5xx_does_not_retry_current_invoke_and_sticks()
-    test_direct_read_timeout_does_not_retry_unknown_outcome()
-    test_direct_4xx_does_not_fallback()
-    test_direct_invalid_json_does_not_retry_unknown_outcome()
+    test_direct_503_retries_with_same_request_id()
+    test_direct_read_timeout_retries_with_same_request_id()
+    test_direct_unknown_outcome_retry_exhaustion_does_not_fallback()
+    test_direct_non_retryable_http_errors_do_not_fallback()
+    test_direct_invalid_json_retries_with_same_request_id()
     test_direct_connect_error_falls_back()
+    test_direct_pool_timeout_retries_then_falls_back()
     test_direct_fallback_when_frontend_direct_missing()
     test_direct_binary_upload_success()
     test_files_write_bytes_uses_direct_upload()
