@@ -7,6 +7,7 @@ and reverse tunnel helpers are exposed as Python objects on ``Sandbox``.
 
 import logging
 import os
+import re
 from collections.abc import Mapping
 from typing import Any, Dict, List, Optional, Union
 from urllib.parse import urlparse
@@ -32,6 +33,7 @@ _AFFINITY_KIND_RESOURCE = 0
 _AFFINITY_REQUIRED = 2
 _LABEL_OPERATION_IN = 0
 _NODE_ID_LABEL = "NODE_ID"
+_SUPPORTED_XPU_TYPES = frozenset({"gpu"})
 
 
 def _get_create_timeout(timeout: Optional[int]) -> int:
@@ -113,6 +115,29 @@ def _compose_gateway_url(*, gateway: str, scheme: str, path: str) -> str:
     return f"{scheme}://{gateway}{route}"
 
 
+def _validate_xpu(xpu: Optional[str]) -> None:
+    if xpu is None:
+        return
+    if not isinstance(xpu, str):
+        raise TypeError("xpu must be a string or None")
+
+    fields = xpu.split(":")
+    if len(fields) != 3 or not fields[0] or not fields[2]:
+        raise ValueError("xpu must have exactly three fields: type:model:count")
+    if any(field != field.strip() for field in fields):
+        raise ValueError("xpu fields must not contain surrounding whitespace")
+
+    xpu_type, _, count_text = fields
+    xpu_type = xpu_type.lower()
+    if xpu_type not in _SUPPORTED_XPU_TYPES:
+        raise ValueError(f"unsupported xpu type: {xpu_type}")
+    if re.fullmatch(r"[0-9]+", count_text) is None:
+        raise ValueError("xpu count must be a positive integer")
+    count = int(count_text)
+    if count <= 0:
+        raise ValueError("xpu count must be a positive integer")
+
+
 class Sandbox:
     """High-level sandbox API for openYuanrong sandboxes.
 
@@ -150,6 +175,7 @@ class Sandbox:
         detached: bool = False,
         node_id: Optional[str] = None,
         *,
+        xpu: Optional[str] = None,
         create_timeout: Optional[int] = None,
         extra_config: Optional[Dict[str, Any]] = None,
     ):
@@ -180,6 +206,9 @@ class Sandbox:
             proxy_port: Reserved for API stability. Frontend owns this port.
             tunnel_connect_timeout: Seconds to wait for the tunnel WebSocket.
             detached: If True, ``kill()`` / context-manager exit skips teardown.
+            xpu: Optional whole-device XPU request in ``type:model:count``
+                format. Leave ``model`` empty to accept any model. The first
+                version supports one ``gpu`` request.
             extra_config: Extra sandbox-side configuration forwarded to sandboxd.
         """
         if image is not None and (
@@ -214,6 +243,7 @@ class Sandbox:
                 raise TypeError("node_id must be a string")
             if not node_id:
                 raise ValueError("node_id cannot be empty string")
+        _validate_xpu(xpu)
         if mounts is None:
             mount_list: List[Mount] = []
         else:
@@ -300,6 +330,8 @@ class Sandbox:
         body["memory"] = memory
         body["cpu_limit"] = cpu_limit
         body["mem_limit"] = mem_limit
+        if xpu is not None:
+            body["xpu"] = xpu
         if env:
             body["env"] = dict(env)
         if node_id:
