@@ -27,6 +27,17 @@ the value is forwarded unchanged; Frontend normalizes the resource type for
 FunctionSystem. An empty model keeps the three-field form and lets
 FunctionSystem select any model.
 
+Request temporary writable storage:
+
+```python
+from yr_sandbox import Sandbox
+
+Sandbox(storage_mb=153600)
+```
+
+`storage_mb` is expressed in MiB. Frontend converts it to bytes in the
+FunctionSystem custom resource named `storage`.
+
 Normally, configure only one sandbox create budget; the other value is derived
 automatically with a 30-second startup buffer:
 

@@ -3,7 +3,11 @@ import inspect
 import unittest
 from unittest.mock import patch
 
-from yr_sandbox import PortForwarding, S3Config, Sandbox
+from yr_sandbox import (
+    PortForwarding,
+    S3Config,
+    Sandbox,
+)
 from yr_sandbox.commands import Commands
 from yr_sandbox.shell import Shells
 
@@ -164,6 +168,40 @@ class SDKContractTests(unittest.TestCase):
                 with self.subTest(xpu=xpu):
                     with self.assertRaisesRegex(error_type, message):
                         Sandbox(image="ubuntu:22.04", xpu=xpu)
+        self.assertEqual(_FakeClient.created, [])
+
+    def test_storage_is_validated_and_forwarded(self):
+        with patch("yr_sandbox.sandbox_api.SandboxClient", _FakeClient):
+            Sandbox(
+                image="ubuntu:22.04",
+                storage_mb=153600,
+                detached=True,
+            )
+
+        body = _FakeClient.created[-1]
+        self.assertEqual(body["storageMb"], 153600)
+
+    def test_storage_default_is_omitted(self):
+        with patch("yr_sandbox.sandbox_api.SandboxClient", _FakeClient):
+            Sandbox(image="ubuntu:22.04", detached=True)
+
+        body = _FakeClient.created[-1]
+        self.assertNotIn("storageMb", body)
+        signature = inspect.signature(Sandbox).parameters
+        self.assertIsNone(signature["storage_mb"].default)
+
+    def test_invalid_storage_is_rejected_before_create(self):
+        invalid_cases = [
+            (True, TypeError),
+            ("1024", TypeError),
+            (0, ValueError),
+            (-1, ValueError),
+        ]
+        with patch("yr_sandbox.sandbox_api.SandboxClient", _FakeClient):
+            for storage_mb, error_type in invalid_cases:
+                with self.subTest(storage_mb=storage_mb):
+                    with self.assertRaises(error_type):
+                        Sandbox(image="ubuntu:22.04", storage_mb=storage_mb)
         self.assertEqual(_FakeClient.created, [])
 
     def test_commands_list_reads_rrt_running_field(self):

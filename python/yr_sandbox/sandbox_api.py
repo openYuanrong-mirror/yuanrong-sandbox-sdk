@@ -176,6 +176,7 @@ class Sandbox:
         node_id: Optional[str] = None,
         *,
         xpu: Optional[str] = None,
+        storage_mb: Optional[int] = None,
         create_timeout: Optional[int] = None,
         extra_config: Optional[Dict[str, Any]] = None,
     ):
@@ -209,6 +210,8 @@ class Sandbox:
             xpu: Optional whole-device XPU request in ``type:model:count``
                 format. Leave ``model`` empty to accept any model. The first
                 version supports one ``gpu`` request.
+            storage_mb: Temporary writable root filesystem capacity in MiB.
+                ``None`` uses the cluster default.
             extra_config: Extra sandbox-side configuration forwarded to sandboxd.
         """
         if image is not None and (
@@ -244,6 +247,11 @@ class Sandbox:
             if not node_id:
                 raise ValueError("node_id cannot be empty string")
         _validate_xpu(xpu)
+        if storage_mb is not None:
+            if isinstance(storage_mb, bool) or not isinstance(storage_mb, int):
+                raise TypeError("storage_mb must be an integer or None")
+            if storage_mb <= 0:
+                raise ValueError("storage_mb must be greater than 0")
         if mounts is None:
             mount_list: List[Mount] = []
         else:
@@ -332,6 +340,8 @@ class Sandbox:
         body["mem_limit"] = mem_limit
         if xpu is not None:
             body["xpu"] = xpu
+        if storage_mb is not None:
+            body["storageMb"] = storage_mb
         if env:
             body["env"] = dict(env)
         if node_id:
