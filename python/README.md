@@ -12,6 +12,32 @@ with Sandbox(image="python:3.12-slim", cpu=2000, memory=4096) as sb:
     print(sb.commands.run("cat /tmp/hello.txt").stdout)
 ```
 
+Request whole GPUs with the ``type:model:count`` form:
+
+```python
+Sandbox(xpu="gpu:l20:1")
+Sandbox(xpu="gpu:h100:2")
+Sandbox(xpu="gpu::1")  # any GPU model
+Sandbox()  # no XPU request
+```
+
+The first version accepts one request, supports only ``gpu``, and requires a
+positive whole-device count. Type matching is case-insensitive in the SDK, and
+the value is forwarded unchanged; Frontend normalizes the resource type for
+FunctionSystem. An empty model keeps the three-field form and lets
+FunctionSystem select any model.
+
+Request temporary writable storage:
+
+```python
+from yr_sandbox import Sandbox
+
+Sandbox(storage_mb=153600)
+```
+
+`storage_mb` is expressed in MiB. Frontend converts it to bytes in the
+FunctionSystem custom resource named `storage`.
+
 Normally, configure only one sandbox create budget; the other value is derived
 automatically with a 30-second startup buffer:
 
