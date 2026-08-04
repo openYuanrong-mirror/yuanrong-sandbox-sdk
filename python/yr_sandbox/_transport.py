@@ -58,6 +58,10 @@ _DIRECT_UNKNOWN_OUTCOME_ERRORS = (
 _DIRECT_MAX_ATTEMPTS = 3
 _DIRECT_RETRY_BACKOFF_SECONDS = 0.1
 _DIRECT_POOL_TIMEOUT_SECONDS = 2.0
+# A single missing route is commonly a transient publication race. Keep trying
+# direct on later logical invokes and only sticky-disable after this many misses
+# have already been tolerated.
+_DIRECT_ROUTE_MISS_BUDGET = 3
 
 _CREATE_MAX_ATTEMPTS = 3
 _CREATE_RETRY_BACKOFF_SECONDS = 0.1
@@ -131,8 +135,10 @@ class SandboxClient:
             os.environ.get("YR_RRT_PORT", "50090").strip() or "50090"
         )
         self._direct_enabled = True
-        # Sticky: set once the direct route proves unreachable.
+        # A 404 falls back immediately for the current invoke. Only a sustained
+        # run of route misses sticky-disables direct for this client.
         self._direct_disabled = False
+        self._direct_route_misses = 0
         self._direct_base = f"{scheme}://{self._server}/direct"
         self._last_create: Dict[str, Any] = {}
         self._resume_chunk_size = int(
@@ -498,20 +504,38 @@ class SandboxClient:
                     headers={"X-YR-Request-ID": request_id},
                 )
             except _DIRECT_SAFE_FALLBACK_ERRORS as exc:
+                self._direct_route_misses = 0
                 last_error = exc
                 last_failure_safe = True
             except _DIRECT_UNKNOWN_OUTCOME_ERRORS as exc:
+                self._direct_route_misses = 0
                 last_error = exc
                 last_failure_safe = False
             except httpx.RequestError as exc:
+                self._direct_route_misses = 0
                 raise SandboxError(
                     "direct invoke outcome is unknown after transport failure "
                     f"(requestId={request_id}): {exc}"
                 ) from exc
             else:
                 if resp.status_code == 404:
-                    self._direct_disabled = True
+                    self._direct_route_misses += 1
+                    if (
+                        self._direct_route_misses > _DIRECT_ROUTE_MISS_BUDGET
+                        and not self._direct_disabled
+                    ):
+                        self._direct_disabled = True
+                        logger.warning(
+                            "direct invoke disabled; all subsequent invokes "
+                            "will use frontend fallback after consecutive "
+                            "route misses "
+                            "request_id=%s action=%s route_misses=%d",
+                            request_id,
+                            action,
+                            self._direct_route_misses,
+                        )
                     return {}, True
+                self._direct_route_misses = 0
                 if resp.status_code in _RETRYABLE_GATEWAY_STATUS_CODES:
                     last_error = _RetryableHTTPStatus(
                         f"HTTP {resp.status_code}: {resp.text}"
