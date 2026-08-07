@@ -319,9 +319,7 @@ class Sandbox:
             "runtime": runtime,
         }
         if image:
-            body["image"] = image
             body["rootfs"] = {
-                "runtime": runtime,
                 "type": "image",
                 "readonly": False,
                 "imageurl": image,
@@ -329,7 +327,6 @@ class Sandbox:
         elif rootfs:
             body["rootfs"] = {
                 "type": "s3",
-                "runtime": runtime,
                 "storageInfo": rootfs.to_dict(),
             }
         if name:

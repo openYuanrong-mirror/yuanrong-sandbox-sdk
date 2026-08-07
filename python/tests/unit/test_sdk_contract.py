@@ -74,7 +74,9 @@ class SDKContractTests(unittest.TestCase):
 
         body = _FakeClient.created[-1]
         self.assertEqual(body["runtime"], "kata")
-        self.assertEqual(body["rootfs"]["runtime"], "kata")
+        self.assertNotIn("runtime", body["rootfs"])
+        self.assertEqual(body["rootfs"]["imageurl"], "ubuntu:22.04")
+        self.assertNotIn("image", body)
         self.assertNotIn("cwd", body)
         self.assertNotIn("cwdMode", body)
         self.assertEqual(
@@ -92,7 +94,7 @@ class SDKContractTests(unittest.TestCase):
 
         body = _FakeClient.created[-1]
         self.assertEqual(body["runtime"], "gvisor-next")
-        self.assertEqual(body["rootfs"]["runtime"], "gvisor-next")
+        self.assertNotIn("runtime", body["rootfs"])
 
     def test_node_id_is_encoded_as_frontend_affinity_semantics(self):
         with patch("yr_sandbox.sandbox_api.SandboxClient", _FakeClient):
@@ -249,6 +251,29 @@ class SDKContractTests(unittest.TestCase):
         body = _FakeClient.created[-1]
         self.assertNotIn("image", body)
         self.assertNotIn("rootfs", body)
+
+    def test_runtime_override_without_explicit_rootfs_preserves_cluster_default(self):
+        with patch("yr_sandbox.sandbox_api.SandboxClient", _FakeClient):
+            Sandbox(runtime="kata", detached=True)
+
+        body = _FakeClient.created[-1]
+        self.assertEqual(body["runtime"], "kata")
+        self.assertNotIn("image", body)
+        self.assertNotIn("rootfs", body)
+
+    def test_s3_rootfs_uses_top_level_runtime_only(self):
+        rootfs = S3Config(
+            endpoint="https://s3.example.com",
+            bucket="rootfs",
+            object="runtime.img",
+        )
+        with patch("yr_sandbox.sandbox_api.SandboxClient", _FakeClient):
+            Sandbox(rootfs=rootfs, runtime="kata", detached=True)
+
+        body = _FakeClient.created[-1]
+        self.assertEqual(body["runtime"], "kata")
+        self.assertEqual(body["rootfs"]["type"], "s3")
+        self.assertNotIn("runtime", body["rootfs"])
 
     def test_image_and_rootfs_are_mutually_exclusive(self):
         rootfs = S3Config(
