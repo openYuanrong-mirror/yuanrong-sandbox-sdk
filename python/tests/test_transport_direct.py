@@ -423,12 +423,14 @@ def test_sandbox_create_timeout_precedence_and_body():
 
     _check(seen[0]["createTimeoutSeconds"] == 70, f"explicit timeout body: {seen[0]}")
     _check(seen[0]["scheduleTimeoutSeconds"] == 30, f"default schedule timeout body: {seen[0]}")
-    _check(seen[0]["runtime"] == "kata", f"runtime body: {seen[0]}")
+    _check(seen[0]["rootfs"]["runtime"] == "kata", f"runtime body: {seen[0]}")
+    _check("runtime" not in seen[0], f"top-level runtime body: {seen[0]}")
     _check(seen[1]["createTimeoutSeconds"] == 90, f"env create timeout body: {seen[1]}")
     _check(seen[1]["scheduleTimeoutSeconds"] == 45, f"explicit schedule timeout body: {seen[1]}")
     _check(seen[2]["createTimeoutSeconds"] == 90, f"env timeout body: {seen[2]}")
     _check(seen[2]["scheduleTimeoutSeconds"] == 30, f"default schedule timeout body: {seen[2]}")
-    _check(seen[2]["runtime"] == "runsc", f"default isolation runtime body: {seen[2]}")
+    _check(seen[2]["rootfs"]["runtime"] == "runsc", f"default isolation runtime body: {seen[2]}")
+    _check("runtime" not in seen[2], f"top-level runtime body: {seen[2]}")
     print("ok: Sandbox create timeout precedence and body")
 
 
