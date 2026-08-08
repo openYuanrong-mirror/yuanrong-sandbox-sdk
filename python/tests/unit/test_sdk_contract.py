@@ -5,6 +5,7 @@ from unittest.mock import patch
 
 from yr_sandbox import (
     PortForwarding,
+    NetworkPolicy,
     S3Config,
     Sandbox,
 )
@@ -18,10 +19,14 @@ class _FakeClient:
     def __init__(self):
         self.calls = []
         self.closed = False
+        self.direct_enabled = True
 
     def create_info(self, body):
         type(self).created.append(dict(body))
         return {"sandboxId": "sandbox-1", "status": "running"}
+
+    def set_direct_enabled(self, enabled):
+        self.direct_enabled = enabled
 
     def invoke(self, sandbox_id, action, args, **_kwargs):
         self.calls.append((sandbox_id, action, args))
@@ -130,6 +135,98 @@ class SDKContractTests(unittest.TestCase):
             )
 
         self.assertEqual(_FakeClient.created[-1]["xpu"], "GPU:L20:2")
+
+    def test_network_defaults_to_unrestricted_and_omits_wire_field(self):
+        with patch("yr_sandbox.sandbox_api.SandboxClient", _FakeClient):
+            sandbox = Sandbox(image="ubuntu:22.04", detached=True)
+
+        self.assertNotIn("network", _FakeClient.created[-1])
+        self.assertTrue(sandbox._client.direct_enabled)
+        self.assertIsNone(inspect.signature(Sandbox).parameters["network"].default)
+
+    def test_block_network_uses_canonical_field_and_disables_direct(self):
+        with patch("yr_sandbox.sandbox_api.SandboxClient", _FakeClient):
+            sandbox = Sandbox(
+                image="ubuntu:22.04",
+                network=NetworkPolicy.block(),
+                detached=True,
+            )
+
+        self.assertEqual(
+            _FakeClient.created[-1]["network"],
+            {"blockNetwork": True},
+        )
+        self.assertNotIn("extra_config", _FakeClient.created[-1])
+        self.assertFalse(sandbox._client.direct_enabled)
+
+    def test_dns_blacklist_is_normalized_and_forwarded(self):
+        policy = NetworkPolicy.deny_dns(
+            "GitHub.COM.", "*.GitHub.com", "github.com"
+        )
+        with patch("yr_sandbox.sandbox_api.SandboxClient", _FakeClient):
+            sandbox = Sandbox(
+                image="ubuntu:22.04",
+                network=policy,
+                detached=True,
+            )
+
+        self.assertEqual(
+            _FakeClient.created[-1]["network"],
+            {"dnsBlacklist": ["github.com", "*.github.com"]},
+        )
+        self.assertNotIn("extra_config", _FakeClient.created[-1])
+        self.assertTrue(sandbox._client.direct_enabled)
+
+    def test_network_policy_preserves_user_extra_config(self):
+        with patch("yr_sandbox.sandbox_api.SandboxClient", _FakeClient):
+            Sandbox(
+                image="ubuntu:22.04",
+                network=NetworkPolicy.block(),
+                extra_config={"runtimeOption": "value"},
+                detached=True,
+            )
+
+        self.assertEqual(
+            _FakeClient.created[-1]["extra_config"],
+            {"runtimeOption": "value"},
+        )
+        self.assertEqual(
+            _FakeClient.created[-1]["network"],
+            {"blockNetwork": True},
+        )
+
+    def test_empty_network_policy_is_omitted(self):
+        with patch("yr_sandbox.sandbox_api.SandboxClient", _FakeClient):
+            Sandbox(
+                image="ubuntu:22.04",
+                network=NetworkPolicy(),
+                detached=True,
+            )
+
+        self.assertNotIn("network", _FakeClient.created[-1])
+        self.assertNotIn("extra_config", _FakeClient.created[-1])
+
+    def test_invalid_network_policy_is_rejected_before_create(self):
+        invalid_factories = [
+            lambda: NetworkPolicy(block_network="yes"),
+            lambda: NetworkPolicy(dns_blacklist="github.com"),
+            lambda: NetworkPolicy.deny_dns(),
+            lambda: NetworkPolicy.deny_dns("github.*"),
+            lambda: NetworkPolicy.deny_dns("github..com"),
+            lambda: NetworkPolicy(
+                block_network=True,
+                dns_blacklist=("github.com",),
+            ),
+        ]
+        for factory in invalid_factories:
+            with self.subTest(factory=factory):
+                with self.assertRaises((TypeError, ValueError)):
+                    factory()
+        with patch("yr_sandbox.sandbox_api.SandboxClient", _FakeClient):
+            with self.assertRaisesRegex(TypeError, "NetworkPolicy"):
+                Sandbox(image="ubuntu:22.04", network={"blockNetwork": True})
+
+        self.assertEqual(_FakeClient.created, [])
 
     def test_xpu_without_model_is_forwarded_without_normalization(self):
         with patch("yr_sandbox.sandbox_api.SandboxClient", _FakeClient):

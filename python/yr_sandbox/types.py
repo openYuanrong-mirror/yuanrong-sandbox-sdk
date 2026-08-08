@@ -1,5 +1,7 @@
+import re
 from dataclasses import dataclass, field
-from typing import Any, Dict, Mapping, Optional
+from typing import Any, Dict, Mapping, Optional, Tuple
+
 
 # Default action timeout in seconds.
 YR_GET_DEFAULT_TIMEOUT = 300
@@ -7,6 +9,83 @@ YR_GET_DEFAULT_TIMEOUT = 300
 # Extra seconds added to the user-specified timeout for the RPC call,
 # to account for network overhead and serialization.
 YR_GET_TIMEOUT_BUFFER = 30
+
+
+_DNS_LABEL_PATTERN = re.compile(r"^[a-z0-9_-]+$")
+
+
+def _normalize_dns_pattern(pattern: str) -> str:
+    if not isinstance(pattern, str):
+        raise TypeError("dns blacklist patterns must be strings")
+    value = pattern.strip().lower().rstrip(".")
+    wildcard = value.startswith("*.")
+    if wildcard:
+        value = value[2:]
+    if not value or "*" in value or "?" in value or len(value) > 253:
+        raise ValueError(f"invalid DNS blacklist pattern: {pattern!r}")
+    for label in value.split("."):
+        if (
+            not label
+            or len(label) > 63
+            or label.startswith("-")
+            or label.endswith("-")
+            or _DNS_LABEL_PATTERN.fullmatch(label) is None
+        ):
+            raise ValueError(f"invalid DNS blacklist pattern: {pattern!r}")
+    return f"*.{value}" if wildcard else value
+
+
+@dataclass(frozen=True)
+class NetworkPolicy:
+    """Creation-time network policy for a sandbox.
+
+    ``block_network`` denies all sandbox traffic except the YuanRong control
+    proxy selected by FunctionSystem. ``dns_blacklist`` denies conventional
+    DNS queries matching exact names or leading ``*.`` suffix patterns.
+    """
+
+    block_network: bool = False
+    dns_blacklist: Tuple[str, ...] = ()
+
+    def __post_init__(self) -> None:
+        if not isinstance(self.block_network, bool):
+            raise TypeError("block_network must be a boolean")
+        if isinstance(self.dns_blacklist, (str, bytes)):
+            raise TypeError("dns_blacklist must be a sequence of patterns")
+        normalized = tuple(
+            dict.fromkeys(
+                _normalize_dns_pattern(item) for item in self.dns_blacklist
+            )
+        )
+        if self.block_network and normalized:
+            raise ValueError(
+                "block_network and dns_blacklist cannot be combined"
+            )
+        object.__setattr__(self, "dns_blacklist", normalized)
+
+    @classmethod
+    def block(cls) -> "NetworkPolicy":
+        """Deny all network traffic except the YuanRong control proxy."""
+        return cls(block_network=True)
+
+    @classmethod
+    def deny_dns(cls, *patterns: str) -> "NetworkPolicy":
+        """Deny DNS queries matching the supplied domain patterns."""
+        if not patterns:
+            raise ValueError("deny_dns requires at least one domain pattern")
+        return cls(dns_blacklist=patterns)
+
+    @property
+    def is_empty(self) -> bool:
+        return not self.block_network and not self.dns_blacklist
+
+    def to_dict(self) -> Dict[str, Any]:
+        result: Dict[str, Any] = {}
+        if self.block_network:
+            result["blockNetwork"] = True
+        if self.dns_blacklist:
+            result["dnsBlacklist"] = list(self.dns_blacklist)
+        return result
 
 
 @dataclass(frozen=True)

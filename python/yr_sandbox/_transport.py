@@ -901,6 +901,14 @@ class SandboxClient:
         """Whether RRT direct invoke first tries the frontend /direct route."""
         return self._direct_enabled
 
+    def set_direct_enabled(self, enabled: bool) -> None:
+        """Select whether control operations may use the frontend direct path."""
+        if not isinstance(enabled, bool):
+            raise TypeError("enabled must be a boolean")
+        self._direct_enabled = enabled
+        if not enabled:
+            self._direct_disabled = True
+
     @property
     def rrt_port(self) -> int:
         """Internal RRT HTTP container port requested during sandbox create."""
