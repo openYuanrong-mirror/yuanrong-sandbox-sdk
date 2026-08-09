@@ -9,6 +9,13 @@ from .types import (
     SandboxInfo,
 )
 
+SDK_CAPABILITIES = frozenset(
+    {
+        "local-close",
+        "tunnel-proxy-port",
+    }
+)
+
 __all__ = [
     # current API
     "Sandbox",
@@ -28,6 +35,7 @@ __all__ = [
     "PortForwarding",
     "NodeInfo",
     "resources",
+    "SDK_CAPABILITIES",
 ]
 
 # Heavy modules are lazy-loaded so lightweight entry points (the yr-sandbox CLI)

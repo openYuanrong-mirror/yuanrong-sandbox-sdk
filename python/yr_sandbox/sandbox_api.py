@@ -26,7 +26,6 @@ from .types import (
 
 logger = logging.getLogger(__name__)
 
-TUNNEL_HTTP_PROXY_URL = "http://127.0.0.1:8766"
 DEFAULT_CREATE_TIMEOUT = 60
 SCHEDULE_TIMEOUT_BUFFER = 30
 _AFFINITY_KIND_RESOURCE = 0
@@ -202,9 +201,10 @@ class Sandbox:
                 a port number (defaults to TCP) or a ``PortForwarding`` object.
             mounts: Custom mount specifications for the sandbox.
             upstream: ``host:port`` or HTTP(S) URL of an SDK-side service to
-                expose inside the sandbox. Frontend owns the sandbox-side
-                control ports; only the declarative enabled flag is sent.
-            proxy_port: Reserved for API stability. Frontend owns this port.
+                expose inside the sandbox.
+            proxy_port: Sandbox-side HTTP proxy port for ``upstream``. The
+                frontend derives the WebSocket tunnel port as
+                ``proxy_port - 1``. Defaults to 8766.
             tunnel_connect_timeout: Seconds to wait for the tunnel WebSocket.
             detached: If True, ``kill()`` / context-manager exit skips teardown.
             xpu: Optional whole-device XPU request in ``type:model:count``
@@ -264,6 +264,10 @@ class Sandbox:
             not isinstance(upstream, str) or not upstream.strip()
         ):
             raise ValueError("upstream must be a non-empty address")
+        if isinstance(proxy_port, bool) or not isinstance(proxy_port, int):
+            raise TypeError("proxy_port must be an integer")
+        if not 2 <= proxy_port <= 65535:
+            raise ValueError("proxy_port must be between 2 and 65535")
 
         # ── port_forwardings ──────────────────────────────────────────────
         self._forwarded_ports: set = set()
@@ -292,7 +296,7 @@ class Sandbox:
             pf_ports.extend(str(port) for port in ports)
         if upstream is not None:
             conflicts = self._forwarded_ports.intersection(
-                {8765, 8766}
+                {proxy_port - 1, proxy_port}
             )
             if conflicts:
                 rendered = ", ".join(str(port) for port in sorted(conflicts))
@@ -303,7 +307,7 @@ class Sandbox:
 
         # ── reverse tunnel ────────────────────────────────────────────────
         self._tunnel_client = None
-        self._tunnel_url = TUNNEL_HTTP_PROXY_URL
+        self._tunnel_url = f"http://127.0.0.1:{proxy_port}"
         self._closed = False
         self._upstream = upstream
 
@@ -365,10 +369,10 @@ class Sandbox:
         if detached:
             body["lifecycle"] = "detached"
         if upstream is not None:
-            # Declarative tunnel request. Frontend owns the internal control
-            # port, forwarded ports, and RRT_TUNNEL_* env injection, then
-            # returns a stable /tunnel/{safeID} URL path.
-            body["tunnel"] = {"enabled": True}
+            # Frontend derives the WebSocket port as proxyPort - 1, owns both
+            # forwarded ports and RRT_TUNNEL_* env injection, then returns a
+            # stable /tunnel/{safeID} URL path.
+            body["tunnel"] = {"enabled": True, "proxyPort": proxy_port}
 
         self._detached = detached
         self._image = image
@@ -404,7 +408,10 @@ class Sandbox:
                 tunnel_info = create_info.get("tunnel") or {}
                 if not isinstance(tunnel_info, dict):
                     tunnel_info = {}
-                self._tunnel_url = tunnel_info.get("proxyUrl") or TUNNEL_HTTP_PROXY_URL
+                self._tunnel_url = (
+                    tunnel_info.get("proxyUrl")
+                    or f"http://127.0.0.1:{proxy_port}"
+                )
                 tunnel_url = tunnel_info.get("url") or tunnel_info.get("path")
                 safe_id = self._client._safe_id(self._sid)
                 tls = os.environ.get("YR_GATEWAY_TLS", "0").strip().lower() in (
@@ -579,7 +586,7 @@ class Sandbox:
             image=info.get("image", self._image),
         )
 
-    def kill(self) -> None:
+    def _close(self, *, delete_remote: bool) -> None:
         if self._closed:
             return
         self._closed = True
@@ -587,21 +594,35 @@ class Sandbox:
             try:
                 self._tunnel_client.stop()
             except Exception as e:
-                logger.debug("tunnel cleanup during kill failed: %s", e)
+                logger.debug("tunnel cleanup during close failed: %s", e)
             self._tunnel_client = None
         try:
             self._shells.close()
         except Exception as e:
-            logger.debug("shell cleanup during kill failed: %s", e)
+            logger.debug("shell cleanup during close failed: %s", e)
         try:
             self._pty._close()
         except Exception as e:
-            logger.debug("PTY cleanup during kill failed: %s", e)
+            logger.debug("PTY cleanup during close failed: %s", e)
         try:
-            if not self._detached:
+            if delete_remote and not self._detached:
                 self._client.delete(self._sid)
         finally:
             self._client.close()
+
+    def close(self) -> None:
+        """Release local clients without deleting the remote sandbox.
+
+        This operation is idempotent. Use :meth:`kill` when the same handle
+        should also delete a non-detached remote sandbox.
+        """
+
+        self._close(delete_remote=False)
+
+    def kill(self) -> None:
+        """Release local clients and delete a non-detached remote sandbox."""
+
+        self._close(delete_remote=True)
 
     @classmethod
     def delete(cls, sandbox_id: str) -> None:

@@ -283,6 +283,42 @@ class SDKContractTests(unittest.TestCase):
         self.assertIn("proxy_port", signature.parameters)
         self.assertIn("tunnel_connect_timeout", signature.parameters)
 
+    def test_proxy_port_is_validated_before_create(self):
+        with patch("yr_sandbox.sandbox_api.SandboxClient", _FakeClient):
+            for invalid in (True, "9001"):
+                with self.subTest(proxy_port=invalid):
+                    with self.assertRaisesRegex(TypeError, "proxy_port"):
+                        Sandbox(
+                            image="ubuntu:22.04",
+                            upstream="127.0.0.1:9000",
+                            proxy_port=invalid,
+                            detached=True,
+                        )
+            for invalid in (1, 65536):
+                with self.subTest(proxy_port=invalid):
+                    with self.assertRaisesRegex(ValueError, "between 2 and 65535"):
+                        Sandbox(
+                            image="ubuntu:22.04",
+                            upstream="127.0.0.1:9000",
+                            proxy_port=invalid,
+                            detached=True,
+                        )
+        self.assertEqual(_FakeClient.created, [])
+
+    def test_custom_reverse_tunnel_ports_conflict_with_user_forwarding(self):
+        with patch("yr_sandbox.sandbox_api.SandboxClient", _FakeClient):
+            for port in (9000, 9001):
+                with self.subTest(port=port):
+                    with self.assertRaisesRegex(ValueError, str(port)):
+                        Sandbox(
+                            image="ubuntu:22.04",
+                            upstream="127.0.0.1:8000",
+                            proxy_port=9001,
+                            port_forwardings=[port],
+                            detached=True,
+                        )
+        self.assertEqual(_FakeClient.created, [])
+
     def test_duplicate_forwarded_ports_are_rejected_before_create(self):
         with patch("yr_sandbox.sandbox_api.SandboxClient", _FakeClient):
             with self.assertRaisesRegex(ValueError, "duplicate"):

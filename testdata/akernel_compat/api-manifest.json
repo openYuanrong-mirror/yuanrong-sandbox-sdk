@@ -16,7 +16,8 @@
     "S3Config",
     "PortForwarding",
     "NodeInfo",
-    "resources"
+    "resources",
+    "SDK_CAPABILITIES"
   ],
   "types": {
     "Sandbox": {

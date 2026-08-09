@@ -50,6 +50,18 @@ When both values are configured, `schedule_timeout <= create_timeout`, and their
 difference must be at least 30 seconds. The 30-second buffer covers rootfs/image
 preparation, runtime startup, and Running-state confirmation.
 
+Configure a non-default sandbox-side reverse-tunnel proxy port when needed:
+
+```python
+sb = Sandbox(upstream="127.0.0.1:8000", proxy_port=9001)
+assert sb.get_tunnel_url() == "http://127.0.0.1:9001"
+```
+
+The frontend derives the WebSocket port as `proxy_port - 1` and owns both
+internal port mappings. User `port_forwardings` must not reuse either port.
+Call `sb.close()` to release only local SDK resources while keeping the remote
+sandbox alive; call `sb.kill()` to also delete a non-detached remote sandbox.
+
 ## Configuration
 
 | Var | Meaning |
