@@ -3,6 +3,7 @@ from .types import (
     CommandResult,
     EntryInfo,
     Mount,
+    NetworkPolicy,
     NodeInfo,
     PortForwarding,
     S3Config,
@@ -31,6 +32,7 @@ __all__ = [
     "CommandInfo",
     "SandboxInfo",
     "Mount",
+    "NetworkPolicy",
     "S3Config",
     "PortForwarding",
     "NodeInfo",
@@ -51,6 +53,7 @@ _lazy_imports = {
     "PortForwarding": ".types",
     "NodeInfo": ".types",
     "CommandInfo": ".types",
+    "NetworkPolicy": ".types",
     "resources": "._resources",
 }
 

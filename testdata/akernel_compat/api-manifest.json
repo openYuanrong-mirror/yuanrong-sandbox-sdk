@@ -15,6 +15,7 @@
     "Mount",
     "S3Config",
     "PortForwarding",
+    "NetworkPolicy",
     "NodeInfo",
     "resources",
     "SDK_CAPABILITIES"

@@ -62,6 +62,34 @@ internal port mappings. User `port_forwardings` must not reuse either port.
 Call `sb.close()` to release only local SDK resources while keeping the remote
 sandbox alive; call `sb.kill()` to also delete a non-detached remote sandbox.
 
+Creation-time network policies are optional:
+
+```python
+from yr_sandbox import NetworkPolicy, Sandbox
+
+Sandbox()  # unrestricted; no policy is sent
+Sandbox(network=NetworkPolicy.block())
+Sandbox(
+    network=NetworkPolicy.deny_dns("github.com", "*.github.com"),
+)
+```
+
+Block mode denies all network traffic except the YuanRong control proxy.
+Commands remain available, and filesystem operations automatically use the
+RuntimeRPC transfer path instead of direct HTTP. Bulk file copies can
+therefore be slower in block mode.
+
+DNS patterns match either one exact name or descendants with a leading
+`*.`; the wildcard does not match the apex. Patterns are lowercased and
+trailing dots are removed. International names must be supplied as ASCII
+punycode. DNS-over-HTTPS and direct connections to a known IP are not covered
+by a DNS blacklist.
+
+`block_network` and `dns_blacklist` cannot be combined. Policies cannot be
+changed through this SDK after creation. The packet ACL is IPv4 and
+stateless. The target sandboxd node must have network ACL support enabled,
+and existing sandboxes must be drained before an operator enables it.
+
 ## Configuration
 
 | Var | Meaning |

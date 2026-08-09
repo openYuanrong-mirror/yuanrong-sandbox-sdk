@@ -19,6 +19,7 @@ from .pty import Pty
 from .shell import Shells
 from .types import (
     Mount,
+    NetworkPolicy,
     PortForwarding,
     S3Config,
     SandboxInfo,
@@ -176,6 +177,7 @@ class Sandbox:
         *,
         xpu: Optional[str] = None,
         storage_mb: Optional[int] = None,
+        network: Optional[NetworkPolicy] = None,
         create_timeout: Optional[int] = None,
         extra_config: Optional[Dict[str, Any]] = None,
     ):
@@ -212,6 +214,8 @@ class Sandbox:
                 version supports one ``gpu`` request.
             storage_mb: Temporary writable root filesystem capacity in MiB.
                 ``None`` uses the cluster default.
+            network: Optional creation-time network policy. Omitting it allows
+                unrestricted network access.
             extra_config: Extra sandbox-side configuration forwarded to sandboxd.
         """
         if image is not None and (
@@ -252,6 +256,8 @@ class Sandbox:
                 raise TypeError("storage_mb must be an integer or None")
             if storage_mb <= 0:
                 raise ValueError("storage_mb must be greater than 0")
+        if network is not None and not isinstance(network, NetworkPolicy):
+            raise TypeError("network must be a NetworkPolicy or None")
         if mounts is None:
             mount_list: List[Mount] = []
         else:
@@ -364,8 +370,10 @@ class Sandbox:
             ]
         if mount_list:
             body["mounts"] = [mount.to_dict() for mount in mount_list]
+        if network is not None and not network.is_empty:
+            body["network"] = network.to_dict()
         if extra_config:
-            body["extra_config"] = extra_config
+            body["extra_config"] = dict(extra_config)
         if detached:
             body["lifecycle"] = "detached"
         if upstream is not None:
@@ -384,6 +392,8 @@ class Sandbox:
         # Frontend owns RRT_HTTP_PORT=50090 and its sandbox network mapping for
         # /direct. SDK callers should not expose that internal control port.
         self._client = SandboxClient()
+        if network is not None and network.block_network:
+            self._client.set_direct_enabled(False)
         if pf_ports:
             body["ports"] = pf_ports
 
