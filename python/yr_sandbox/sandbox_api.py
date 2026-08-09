@@ -326,22 +326,23 @@ class Sandbox:
             "idleTimeoutSeconds": idle_timeout,
             "createTimeoutSeconds": resolved_create_timeout,
             "scheduleTimeoutSeconds": resolved_schedule_timeout,
-            "runtime": runtime,
+            "rootfs": {"runtime": runtime},
         }
         if image:
-            body["image"] = image
-            body["rootfs"] = {
-                "runtime": runtime,
-                "type": "image",
-                "readonly": False,
-                "imageurl": image,
-            }
+            body["rootfs"].update(
+                {
+                    "type": "image",
+                    "readonly": False,
+                    "imageurl": image,
+                }
+            )
         elif rootfs:
-            body["rootfs"] = {
-                "type": "s3",
-                "runtime": runtime,
-                "storageInfo": rootfs.to_dict(),
-            }
+            body["rootfs"].update(
+                {
+                    "type": "s3",
+                    "storageInfo": rootfs.to_dict(),
+                }
+            )
         if name:
             body["name"] = name
         body["cpu"] = cpu

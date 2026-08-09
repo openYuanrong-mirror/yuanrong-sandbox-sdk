@@ -78,8 +78,10 @@ class SDKContractTests(unittest.TestCase):
             sandbox.commands.run("pwd", timeout=10)
 
         body = _FakeClient.created[-1]
-        self.assertEqual(body["runtime"], "kata")
+        self.assertNotIn("runtime", body)
         self.assertEqual(body["rootfs"]["runtime"], "kata")
+        self.assertEqual(body["rootfs"]["imageurl"], "ubuntu:22.04")
+        self.assertNotIn("image", body)
         self.assertNotIn("cwd", body)
         self.assertNotIn("cwdMode", body)
         self.assertEqual(
@@ -96,7 +98,7 @@ class SDKContractTests(unittest.TestCase):
             )
 
         body = _FakeClient.created[-1]
-        self.assertEqual(body["runtime"], "gvisor-next")
+        self.assertNotIn("runtime", body)
         self.assertEqual(body["rootfs"]["runtime"], "gvisor-next")
 
     def test_node_id_is_encoded_as_frontend_affinity_semantics(self):
@@ -345,7 +347,30 @@ class SDKContractTests(unittest.TestCase):
 
         body = _FakeClient.created[-1]
         self.assertNotIn("image", body)
-        self.assertNotIn("rootfs", body)
+        self.assertEqual(body["rootfs"], {"runtime": "runsc"})
+
+    def test_runtime_override_without_explicit_rootfs_preserves_cluster_default(self):
+        with patch("yr_sandbox.sandbox_api.SandboxClient", _FakeClient):
+            Sandbox(runtime="kata", detached=True)
+
+        body = _FakeClient.created[-1]
+        self.assertNotIn("runtime", body)
+        self.assertNotIn("image", body)
+        self.assertEqual(body["rootfs"], {"runtime": "kata"})
+
+    def test_s3_rootfs_uses_nested_runtime_only(self):
+        rootfs = S3Config(
+            endpoint="https://s3.example.com",
+            bucket="rootfs",
+            object="runtime.img",
+        )
+        with patch("yr_sandbox.sandbox_api.SandboxClient", _FakeClient):
+            Sandbox(rootfs=rootfs, runtime="kata", detached=True)
+
+        body = _FakeClient.created[-1]
+        self.assertNotIn("runtime", body)
+        self.assertEqual(body["rootfs"]["type"], "s3")
+        self.assertEqual(body["rootfs"]["runtime"], "kata")
 
     def test_image_and_rootfs_are_mutually_exclusive(self):
         rootfs = S3Config(
