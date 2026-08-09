@@ -1295,7 +1295,7 @@ def test_reverse_tunnel_url_uses_gateway_tunnel_alias():
         f"SDK should not request RRT/tunnel control ports, got {seen['create_ports']}",
     )
     _check(
-        seen["create_tunnel"] == {"enabled": True},
+        seen["create_tunnel"] == {"enabled": True, "proxyPort": 8766},
         f"SDK should ask frontend for tunnel declaratively, got {seen.get('create_tunnel')}",
     )
     _check(
@@ -1379,7 +1379,10 @@ def test_reverse_tunnel_uses_frontend_returned_tunnel_metadata():
     _check(seen["url"] == "ws://router:8080/tunnel/frontend-returned", f"returned tunnel url mismatch: {seen['url']}")
     _check(seen["create_ports"] is None, f"SDK leaked control ports: {seen['create_ports']}")
     _check(seen["create_env"] == {"USER_ENV": "ok"}, f"SDK should not set RRT envs: {seen['create_env']}")
-    _check(seen["create_tunnel"] == {"enabled": True}, f"declarative tunnel mismatch: {seen['create_tunnel']}")
+    _check(
+        seen["create_tunnel"] == {"enabled": True, "proxyPort": 9876},
+        f"declarative tunnel mismatch: {seen['create_tunnel']}",
+    )
     _check(seen["token"] is None, "plaintext tunnel should not carry token")
     print("ok: reverse tunnel uses frontend-returned metadata")
 

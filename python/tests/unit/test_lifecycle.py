@@ -51,6 +51,22 @@ class LifecycleTests(unittest.TestCase):
 
         self.assertTrue(sandbox._client.closed)
 
+    def test_close_releases_local_resources_without_deleting_remote(self):
+        sandbox = object.__new__(Sandbox)
+        sandbox._detached = False
+        sandbox._tunnel_client = None
+        sandbox._shells = _Shells()
+        sandbox._pty = _PTY()
+        sandbox._client = _CloseTracker()
+        sandbox._sid = "sandbox-1"
+        sandbox._closed = False
+
+        sandbox.close()
+        sandbox.close()
+
+        self.assertEqual(sandbox._client.deleted, [])
+        self.assertEqual(sandbox._client.close_count, 1)
+
     def test_kill_is_idempotent(self):
         sandbox = object.__new__(Sandbox)
         sandbox._detached = False
