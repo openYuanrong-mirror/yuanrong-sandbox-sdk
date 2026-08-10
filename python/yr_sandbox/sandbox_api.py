@@ -393,8 +393,6 @@ class Sandbox:
         # Frontend owns RRT_HTTP_PORT=50090 and its sandbox network mapping for
         # /direct. SDK callers should not expose that internal control port.
         self._client = SandboxClient()
-        if network is not None and network.block_network:
-            self._client.set_direct_enabled(False)
         if pf_ports:
             body["ports"] = pf_ports
 
