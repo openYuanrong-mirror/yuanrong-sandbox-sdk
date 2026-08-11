@@ -27,6 +27,7 @@ import uuid
 from typing import Any, Optional
 from urllib.parse import quote, urljoin, urlsplit, urlunsplit
 
+import httpx
 import websockets.asyncio.client as ws_client
 import websockets.exceptions as ws_exc
 
@@ -206,6 +207,12 @@ class TunnelClient:
 
     async def _connect_loop(self, tunnel_ws_url: str) -> None:
         failures = 0
+        # Loading CA certificates is expensive; reuse both contexts across reconnects.
+        ssl_context = _ssl_context_for_tunnel(tunnel_ws_url)
+        http_ssl_context = httpx.create_ssl_context(
+            verify=True,
+            trust_env=False,
+        )
         while not self._stopping.is_set():
             try:
                 _extra_headers = {}
@@ -226,7 +233,6 @@ class TunnelClient:
                         connect_url = (
                             f"{connect_url}{sep}token={quote(self._token, safe='')}"
                         )
-                _ssl_ctx = _ssl_context_for_tunnel(tunnel_ws_url)
                 async with ws_client.connect(
                     connect_url,
                     max_size=2**23,
@@ -236,7 +242,7 @@ class TunnelClient:
                     ping_interval=None,
                     ping_timeout=None,
                     close_timeout=5,
-                    ssl=_ssl_ctx,
+                    ssl=ssl_context,
                     additional_headers=_extra_headers,
                 ) as ws:
                     self._ws = ws
@@ -244,9 +250,10 @@ class TunnelClient:
                     failures = 0
                     logger.info("TunnelClient connected: %s", tunnel_ws_url)
                     try:
-                        await self._proxy_loop(ws)
+                        await self._proxy_loop(ws, http_ssl_context)
                     finally:
                         self._ws = None
+                        self._connected.clear()
             except (ws_exc.ConnectionClosed, OSError, asyncio.TimeoutError) as e:
                 self._connected.clear()
                 failures += 1
@@ -292,7 +299,7 @@ class TunnelClient:
                     return
                 await asyncio.sleep(_RECONNECT_DELAY)
 
-    async def _proxy_loop(self, ws) -> None:
+    async def _proxy_loop(self, ws, http_ssl_context=None) -> None:
         """Relay rrt tunnel frames to/from the upstream HTTP service.
 
         rrt's tunnel server (Port A) speaks a JSON frame protocol over WS TEXT
@@ -306,8 +313,6 @@ class TunnelClient:
         import asyncio
         import base64
         import json
-
-        import httpx
 
         send_lock = asyncio.Lock()
         inflight: dict = {}
@@ -583,9 +588,11 @@ class TunnelClient:
         tasks: set = set()
         heartbeat_task = asyncio.create_task(heartbeat_loop())
         try:
+            verify = http_ssl_context if http_ssl_context is not None else True
             async with httpx.AsyncClient(
                 limits=limits,
                 timeout=httpx.Timeout(60.0),
+                verify=verify,
                 trust_env=False,
                 cookies=_NoCookieJar(),
             ) as client:

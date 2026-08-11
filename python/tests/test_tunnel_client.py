@@ -416,6 +416,88 @@ class TunnelClientTlsTests(unittest.IsolatedAsyncioTestCase):
         self.assertIsNone(captured["ping_interval"])
         self.assertIsNone(captured["ping_timeout"])
 
+    async def test_reconnect_reuses_ssl_contexts_across_http_clients(self):
+        client = TunnelClient(upstream="127.0.0.1:1")
+        connection_count = 0
+        http_client_count = 0
+        http_client_close_count = 0
+        ssl_contexts = []
+        http_verify_values = []
+
+        class _EmptyWebSocket:
+            def __aiter__(self):
+                async def messages():
+                    if False:
+                        yield None
+
+                return messages()
+
+        class _Connected:
+            async def __aenter__(self):
+                if connection_count == 3:
+                    client._stopping.set()
+                return _EmptyWebSocket()
+
+            async def __aexit__(self, *_args):
+                return False
+
+        def fake_connect(_url, **kwargs):
+            nonlocal connection_count
+            connection_count += 1
+            ssl_contexts.append(kwargs["ssl"])
+            return _Connected()
+
+        class FakeHttpClient:
+            def __init__(self, **kwargs):
+                nonlocal http_client_count
+                http_client_count += 1
+                http_verify_values.append(kwargs["verify"])
+
+            async def __aenter__(self):
+                return self
+
+            async def __aexit__(self, *_args):
+                nonlocal http_client_close_count
+                http_client_close_count += 1
+                return False
+
+        expected_context = ssl.create_default_context()
+        expected_http_context = object()
+        with (
+            mock.patch.object(
+                tunnel_client.ssl,
+                "create_default_context",
+                return_value=expected_context,
+            ) as create_context,
+            mock.patch.object(
+                tunnel_client.ws_client,
+                "connect",
+                side_effect=fake_connect,
+            ),
+            mock.patch.object(
+                tunnel_client.httpx,
+                "create_ssl_context",
+                return_value=expected_http_context,
+            ) as create_http_context,
+            mock.patch.object(
+                tunnel_client.httpx,
+                "AsyncClient",
+                FakeHttpClient,
+            ),
+        ):
+            await client._connect_loop("wss://tunnel.example.test/path")
+
+        self.assertEqual(connection_count, 3)
+        create_context.assert_called_once_with(cafile=None)
+        create_http_context.assert_called_once_with(verify=True, trust_env=False)
+        self.assertEqual(http_client_count, 3)
+        self.assertEqual(http_client_close_count, 3)
+        self.assertTrue(all(context is expected_context for context in ssl_contexts))
+        self.assertTrue(
+            all(context is expected_http_context for context in http_verify_values)
+        )
+        self.assertFalse(client._connected.is_set())
+
     def test_wss_uses_explicit_ca_bundle(self):
         expected = ssl.create_default_context()
         with (
