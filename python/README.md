@@ -74,10 +74,12 @@ Sandbox(
 )
 ```
 
-Block mode denies all network traffic except the YuanRong control proxy.
-Commands remain available, and filesystem operations automatically use the
-RuntimeRPC transfer path instead of direct HTTP. Bulk file copies can
-therefore be slower in block mode.
+Block mode denies new network flows except the YuanRong control proxy and
+published sandbox target ports used by frontend direct file I/O, reverse
+tunnels, and explicit user port forwarding. Replies to allowed TCP, UDP, and
+related ICMP traffic are admitted from connection state. Commands and the
+frontend `/direct` filesystem path remain available; bounded RuntimeRPC chunks
+remain a fallback when direct transport fails.
 
 DNS patterns match either one exact name or descendants with a leading
 `*.`; the wildcard does not match the apex. Patterns are lowercased and
@@ -86,9 +88,10 @@ punycode. DNS-over-HTTPS and direct connections to a known IP are not covered
 by a DNS blacklist.
 
 `block_network` and `dns_blacklist` cannot be combined. Policies cannot be
-changed through this SDK after creation. The packet ACL is IPv4 and
-stateless. The target sandboxd node must have network ACL support enabled,
-and existing sandboxes must be drained before an operator enables it.
+changed through this SDK after creation. The packet ACL is stateful IPv4 and
+supports IPv4 fragments. The target sandboxd node must have network ACL
+support enabled, and existing sandboxes must be drained before an operator
+enables it.
 
 ## Configuration
 

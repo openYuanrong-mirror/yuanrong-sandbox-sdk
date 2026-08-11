@@ -146,7 +146,7 @@ class SDKContractTests(unittest.TestCase):
         self.assertTrue(sandbox._client.direct_enabled)
         self.assertIsNone(inspect.signature(Sandbox).parameters["network"].default)
 
-    def test_block_network_uses_canonical_field_and_disables_direct(self):
+    def test_block_network_uses_canonical_field_and_keeps_direct(self):
         with patch("yr_sandbox.sandbox_api.SandboxClient", _FakeClient):
             sandbox = Sandbox(
                 image="ubuntu:22.04",
@@ -159,7 +159,7 @@ class SDKContractTests(unittest.TestCase):
             {"blockNetwork": True},
         )
         self.assertNotIn("extra_config", _FakeClient.created[-1])
-        self.assertFalse(sandbox._client.direct_enabled)
+        self.assertTrue(sandbox._client.direct_enabled)
 
     def test_dns_blacklist_is_normalized_and_forwarded(self):
         policy = NetworkPolicy.deny_dns(

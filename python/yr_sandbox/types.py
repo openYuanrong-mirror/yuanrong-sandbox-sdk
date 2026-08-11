@@ -39,9 +39,11 @@ def _normalize_dns_pattern(pattern: str) -> str:
 class NetworkPolicy:
     """Creation-time network policy for a sandbox.
 
-    ``block_network`` denies all sandbox traffic except the YuanRong control
-    proxy selected by FunctionSystem. ``dns_blacklist`` denies conventional
-    DNS queries matching exact names or leading ``*.`` suffix patterns.
+    ``block_network`` denies new sandbox network flows except the YuanRong
+    control proxy and published sandbox ports required by SDK routes and
+    explicit port forwarding. Replies to allowed flows are stateful.
+    ``dns_blacklist`` denies conventional DNS queries matching exact names or
+    leading ``*.`` suffix patterns.
     """
 
     block_network: bool = False
@@ -65,7 +67,7 @@ class NetworkPolicy:
 
     @classmethod
     def block(cls) -> "NetworkPolicy":
-        """Deny all network traffic except the YuanRong control proxy."""
+        """Deny new flows except required YuanRong and published-port paths."""
         return cls(block_network=True)
 
     @classmethod

@@ -2,8 +2,9 @@
 
 Small file operations use frontend invoke actions. Binary file and directory
 copy paths prefer the frontend ``/direct`` route so large payloads avoid JSON
-envelopes. Network-blocked sandboxes use RuntimeRPC chunk actions because the
-direct node route is intentionally outside their allowlist.
+envelopes. The RRT direct route is a published sandbox target and remains
+available under a block-network policy; RuntimeRPC chunks remain the bounded
+fallback for transport failures.
 """
 
 import os
