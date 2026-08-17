@@ -77,7 +77,7 @@ class HelloFrameTests(unittest.TestCase):
                 "max_inflight": 16,
                 "stream_window_frames": 16,
                 "max_body_size": 536870912,
-                "max_ws_message_size": 1048576,
+                "max_ws_message_size": 8388608,
             },
         )
 

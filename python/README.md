@@ -105,7 +105,7 @@ enables it.
 | `YR_TUNNEL_CONNECT_TIMEOUT` | Reverse tunnel WebSocket connection wait in seconds. Default: `60`. |
 | `YR_TUNNEL_PROTOCOL_VERSION` | Highest reverse-tunnel protocol version to advertise. Default/cap: `2`. |
 | `YR_TUNNEL_MAX_BODY_SIZE` | Per-request or response HTTP body bound advertised to the peer. HTTP bodies are streamed. Default: `512 MiB`; cap: `1 GiB`. |
-| `YR_TUNNEL_MAX_WS_MESSAGE_SIZE` | Per-message application WebSocket bound advertised separately because each message is reassembled. Default: `1 MiB`; cap: `8 MiB`. Use application-level chunking for larger payloads. |
+| `YR_TUNNEL_MAX_WS_MESSAGE_SIZE` | Per-message application WebSocket bound advertised separately because each message is reassembled. Default/cap: `8 MiB`; set a lower value for tighter memory budgets. Use application-level chunking for larger payloads. |
 | `YR_TUNNEL_STREAM_CHUNK_BYTES` | V2 binary-frame payload bound. Default/cap: `64 KiB`; minimum: `1 KiB`. The fixed cap keeps the global 480-frame data budget below `30 MiB`. |
 | `YR_TUNNEL_MAX_INFLIGHT` | Concurrent tunnel HTTP work bound. Default: `16`; cap: `1024`. |
 | `YR_TUNNEL_STREAM_WINDOW_FRAMES` | Per-stream credit window and request queue bound. Default: `16`; cap: `1024`, further reduced so all negotiated HTTP windows fit the fixed outbound frame budget. |
