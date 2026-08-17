@@ -11,7 +11,6 @@ from yr_sandbox.tunnel_protocol import (
     hello_frame,
 )
 
-
 REQUEST_ID = "00112233-4455-6677-8899-aabbccddeeff"
 
 
@@ -77,6 +76,7 @@ class HelloFrameTests(unittest.TestCase):
                 "max_stream_chunk": 65536,
                 "max_inflight": 16,
                 "stream_window_frames": 16,
+                "max_body_size": 67108864,
             },
         )
 

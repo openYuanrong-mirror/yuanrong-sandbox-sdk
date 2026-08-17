@@ -103,7 +103,17 @@ enables it.
 | `YR_GATEWAY_ADDRESS` | Optional sandbox gateway/router `host:port` for tunnel and user port URLs. Falls back to `YR_SERVER_ADDRESS`. |
 | `YR_GATEWAY_TLS` | Set `1/true/yes` to use WSS for gateway tunnel routes. Default: `0`. |
 | `YR_TUNNEL_CONNECT_TIMEOUT` | Reverse tunnel WebSocket connection wait in seconds. Default: `60`. |
+| `YR_TUNNEL_PROTOCOL_VERSION` | Highest reverse-tunnel protocol version to advertise. Default/cap: `2`. |
+| `YR_TUNNEL_MAX_BODY_SIZE` | Per-request, response, or WebSocket-message bound advertised to the peer. Default: `64 MiB`; cap: `1 GiB`. |
+| `YR_TUNNEL_STREAM_CHUNK_BYTES` | V2 binary-frame payload bound. Default: `64 KiB`; cap: `1 MiB` and the body bound. |
+| `YR_TUNNEL_MAX_INFLIGHT` | Concurrent tunnel HTTP work bound. Default: `16`; cap: `1024`. |
+| `YR_TUNNEL_STREAM_WINDOW_FRAMES` | Per-stream credit window and request queue bound. Default: `16`; cap: `1024`, further reduced so all negotiated HTTP windows fit the fixed outbound frame budget. |
+| `YR_TUNNEL_FAST_PATH_BODY_BYTES` | Largest request/response kept on the small JSON fast path after V2 negotiation. Default: `64 KiB`; capped by the body bound. |
 | `YR_SANDBOX_CREATE_TIMEOUT` | Sandbox end-to-end create budget in seconds. Default: `60`; must be greater than the 30-second scheduling buffer. |
+
+Tunnel limits are process-local, optional overrides. The SDK and rrt-runtime
+advertise their values in `hello` and use the lower value, so existing AKernel
+sandbox creation does not need to inject matching variables for the defaults.
 
 ## Build
 

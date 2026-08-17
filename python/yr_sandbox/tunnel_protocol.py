@@ -11,7 +11,6 @@ import uuid
 from dataclasses import dataclass
 from enum import IntEnum
 
-
 PROTOCOL_VERSION = 2
 BINARY_ENVELOPE_VERSION = 1
 BINARY_MAGIC = b"YD"
@@ -19,6 +18,8 @@ DEFAULT_STREAM_CHUNK_BYTES = 64 * 1024
 DEFAULT_FAST_PATH_BODY_BYTES = 64 * 1024
 DEFAULT_MAX_INFLIGHT = 16
 DEFAULT_STREAM_WINDOW_FRAMES = 16
+DEFAULT_MAX_BODY_BYTES = 64 * 1024 * 1024
+MAX_V1_BODY_BYTES = 5 * 1024 * 1024
 _END_OF_BODY = 0x01
 _UUID_BYTES = 16
 _HEADER = struct.Struct("!2sBBB16sBI")
@@ -52,15 +53,18 @@ class BinaryEnvelope:
         except (ValueError, AttributeError) as exc:
             raise ProtocolError("binary envelope id must be a UUID") from exc
         flags = _END_OF_BODY if self.end_of_body else 0
-        return _HEADER.pack(
-            BINARY_MAGIC,
-            BINARY_ENVELOPE_VERSION,
-            int(self.kind),
-            _UUID_BYTES,
-            request_uuid.bytes,
-            flags,
-            len(self.payload),
-        ) + self.payload
+        return (
+            _HEADER.pack(
+                BINARY_MAGIC,
+                BINARY_ENVELOPE_VERSION,
+                int(self.kind),
+                _UUID_BYTES,
+                request_uuid.bytes,
+                flags,
+                len(self.payload),
+            )
+            + self.payload
+        )
 
     @classmethod
     def decode(
@@ -109,6 +113,7 @@ def hello_frame(
     max_stream_chunk: int = DEFAULT_STREAM_CHUNK_BYTES,
     max_inflight: int = DEFAULT_MAX_INFLIGHT,
     stream_window_frames: int = DEFAULT_STREAM_WINDOW_FRAMES,
+    max_body_size: int = DEFAULT_MAX_BODY_BYTES,
 ) -> dict:
     if protocol_version <= 0:
         raise ValueError("protocol_version must be greater than zero")
@@ -118,10 +123,13 @@ def hello_frame(
         raise ValueError("max_inflight must be greater than zero")
     if stream_window_frames <= 0:
         raise ValueError("stream_window_frames must be greater than zero")
+    if max_body_size <= 0:
+        raise ValueError("max_body_size must be greater than zero")
     return {
         "type": "hello",
         "protocol_version": protocol_version,
         "max_stream_chunk": max_stream_chunk,
         "max_inflight": max_inflight,
         "stream_window_frames": stream_window_frames,
+        "max_body_size": max_body_size,
     }

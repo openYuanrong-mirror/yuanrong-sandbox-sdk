@@ -94,7 +94,7 @@ dependencies = [
 [package.metadata]
 requires-dist = [
     { name = "httpx", specifier = ">=0.24" },
-    { name = "websockets", specifier = ">=10.0" },
+    { name = "websockets", specifier = ">=13.0" },
 ]
 
 [[package]]

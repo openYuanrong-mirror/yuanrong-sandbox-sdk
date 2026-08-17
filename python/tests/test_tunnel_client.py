@@ -240,6 +240,102 @@ class TunnelClientRequestTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(body, payload)
         self.assertEqual(headers.get("Content-Length"), str(len(payload)))
 
+    async def test_failed_stream_absorbs_late_window_data_without_reconnect(self):
+        request_id = "00112233-4455-6677-8899-aabbccddeeff"
+        websocket = _FrameWebSocket()
+        websocket.feed(hello_frame())
+        websocket.feed(
+            {
+                "type": "http_req_begin",
+                "id": request_id,
+                "method": "POST",
+                "path": "/unreachable",
+                "headers": [],
+                "content_length": 1,
+            }
+        )
+        client = TunnelClient(upstream="127.0.0.1:1")
+        proxy_task = asyncio.create_task(client._proxy_loop(websocket))
+
+        window = await asyncio.wait_for(websocket.sent.get(), timeout=2)
+        self.assertEqual(window["type"], "window")
+        error = await asyncio.wait_for(websocket.sent.get(), timeout=2)
+        self.assertEqual(error["type"], "error")
+        self.assertEqual(error["id"], request_id)
+
+        websocket._incoming.put_nowait(
+            BinaryEnvelope(
+                request_id=request_id,
+                kind=BinaryKind.HTTP_REQUEST_DATA,
+                payload=b"x",
+            ).encode()
+        )
+        websocket.feed({"type": "http_req_end", "id": request_id})
+        websocket.feed({"type": "ping", "id": "still-alive", "timestamp": 1})
+        pong = await asyncio.wait_for(websocket.sent.get(), timeout=2)
+        self.assertEqual(pong["type"], "pong")
+        self.assertEqual(pong["id"], "still-alive")
+
+        websocket.close_input()
+        await asyncio.wait_for(proxy_task, timeout=2)
+
+    async def test_negotiated_peer_body_limit_rejects_larger_stream(self):
+        request_id = "00112233-4455-6677-8899-aabbccddeeff"
+        websocket = _FrameWebSocket()
+        websocket.feed(hello_frame(max_body_size=1))
+        websocket.feed(
+            {
+                "type": "http_req_begin",
+                "id": request_id,
+                "method": "POST",
+                "path": "/too-large",
+                "headers": [],
+                "content_length": 2,
+            }
+        )
+        websocket.feed({"type": "ping", "id": "still-alive", "timestamp": 1})
+        client = TunnelClient(upstream=f"127.0.0.1:{self.server.server_port}")
+        proxy_task = asyncio.create_task(client._proxy_loop(websocket))
+
+        error = await asyncio.wait_for(websocket.sent.get(), timeout=2)
+        self.assertEqual(error["type"], "error")
+        self.assertIn("exceeds", error["message"])
+        pong = await asyncio.wait_for(websocket.sent.get(), timeout=2)
+        self.assertEqual(pong["type"], "pong")
+
+        websocket.close_input()
+        await asyncio.wait_for(proxy_task, timeout=2)
+
+    async def test_peer_error_cancels_only_its_stream(self):
+        request_id = "00112233-4455-6677-8899-aabbccddeeff"
+        websocket = _FrameWebSocket()
+        websocket.feed(hello_frame())
+        websocket.feed(
+            {
+                "type": "http_req_begin",
+                "id": request_id,
+                "method": "POST",
+                "path": "/stream",
+                "headers": [],
+                "content_length": 1,
+            }
+        )
+        client = TunnelClient(upstream=f"127.0.0.1:{self.server.server_port}")
+        proxy_task = asyncio.create_task(client._proxy_loop(websocket))
+        window = await asyncio.wait_for(websocket.sent.get(), timeout=2)
+        self.assertEqual(window["type"], "window")
+
+        websocket.feed(
+            {"type": "error", "id": request_id, "message": "downstream closed"}
+        )
+        websocket.feed({"type": "ping", "id": "still-alive", "timestamp": 2})
+        pong = await asyncio.wait_for(websocket.sent.get(), timeout=2)
+        self.assertEqual(pong["type"], "pong")
+        self.assertEqual(pong["id"], "still-alive")
+
+        websocket.close_input()
+        await asyncio.wait_for(proxy_task, timeout=2)
+
     async def test_v2_small_request_streams_unknown_length_response(self):
         request_id = "00112233-4455-6677-8899-aabbccddeeff"
         websocket = _FrameWebSocket()
@@ -554,6 +650,38 @@ class TunnelClientHeartbeatTests(unittest.IsolatedAsyncioTestCase):
         await asyncio.wait_for(websocket.closed.wait(), timeout=1)
         with self.assertRaisesRegex(asyncio.TimeoutError, "heartbeat"):
             await asyncio.wait_for(proxy_task, timeout=1)
+
+
+class TunnelClientConfigurationTests(unittest.TestCase):
+    def test_tunnel_limits_are_capped_and_internally_consistent(self):
+        with mock.patch.dict(
+            os.environ,
+            {
+                "YR_TUNNEL_PROTOCOL_VERSION": "99",
+                "YR_TUNNEL_MAX_BODY_SIZE": str(2 * 1024 * 1024 * 1024),
+                "YR_TUNNEL_STREAM_CHUNK_BYTES": str(2 * 1024 * 1024),
+                "YR_TUNNEL_MAX_INFLIGHT": "2048",
+                "YR_TUNNEL_STREAM_WINDOW_FRAMES": "2048",
+                "YR_TUNNEL_FAST_PATH_BODY_BYTES": str(2 * 1024 * 1024 * 1024),
+            },
+            clear=False,
+        ):
+            client = TunnelClient(upstream="127.0.0.1:1")
+        self.assertEqual(client._protocol_version, 2)
+        self.assertEqual(client._max_body_size, 1024 * 1024 * 1024)
+        self.assertEqual(client._max_stream_chunk, 1024 * 1024)
+        self.assertEqual(client._max_inflight, 1024)
+        self.assertEqual(client._stream_window_frames, 1024)
+        self.assertEqual(client._fast_path_body_bytes, client._max_body_size)
+
+    def test_invalid_tunnel_limit_is_rejected_at_construction(self):
+        with mock.patch.dict(
+            os.environ,
+            {"YR_TUNNEL_MAX_BODY_SIZE": "not-an-integer"},
+            clear=False,
+        ):
+            with self.assertRaisesRegex(ValueError, "positive integer"):
+                TunnelClient(upstream="127.0.0.1:1")
 
 
 class TunnelClientTlsTests(unittest.IsolatedAsyncioTestCase):
