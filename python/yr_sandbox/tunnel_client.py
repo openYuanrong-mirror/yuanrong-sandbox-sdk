@@ -18,6 +18,7 @@ Architecture:
 
 import asyncio
 import http.cookiejar
+import json
 import logging
 import os
 import ssl
@@ -30,6 +31,18 @@ from urllib.parse import quote, urljoin, urlsplit, urlunsplit
 import httpx
 import websockets.asyncio.client as ws_client
 import websockets.exceptions as ws_exc
+
+from .tunnel_protocol import (
+    BinaryEnvelope,
+    BinaryKind,
+    DEFAULT_FAST_PATH_BODY_BYTES,
+    DEFAULT_MAX_INFLIGHT,
+    DEFAULT_STREAM_CHUNK_BYTES,
+    DEFAULT_STREAM_WINDOW_FRAMES,
+    PROTOCOL_VERSION,
+    ProtocolError,
+    hello_frame,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -54,6 +67,14 @@ _HOP_BY_HOP_HEADERS = frozenset(
         "upgrade",
     }
 )
+
+
+def _positive_int_env(name: str, default: int) -> int:
+    raw = os.environ.get(name)
+    value = default if raw is None else int(raw)
+    if value <= 0:
+        raise ValueError(f"{name} must be greater than zero")
+    return value
 
 
 def _headers_for_rebuilt_request(headers):
@@ -141,6 +162,24 @@ class TunnelClient:
         self._token = token
         self._ping_interval = ping_interval
         self._ping_timeout = ping_timeout
+        self._protocol_version = _positive_int_env(
+            "YR_TUNNEL_PROTOCOL_VERSION", PROTOCOL_VERSION
+        )
+        self._max_stream_chunk = _positive_int_env(
+            "YR_TUNNEL_STREAM_CHUNK_BYTES", DEFAULT_STREAM_CHUNK_BYTES
+        )
+        self._max_inflight = _positive_int_env(
+            "YR_TUNNEL_MAX_INFLIGHT", DEFAULT_MAX_INFLIGHT
+        )
+        self._stream_window_frames = _positive_int_env(
+            "YR_TUNNEL_STREAM_WINDOW_FRAMES", DEFAULT_STREAM_WINDOW_FRAMES
+        )
+        self._max_body_size = _positive_int_env(
+            "YR_TUNNEL_MAX_BODY_SIZE", 64 * 1024 * 1024
+        )
+        self._fast_path_body_bytes = _positive_int_env(
+            "YR_TUNNEL_FAST_PATH_BODY_BYTES", DEFAULT_FAST_PATH_BODY_BYTES
+        )
         self._loop: Optional[asyncio.AbstractEventLoop] = None
         self._thread: Optional[threading.Thread] = None
         self._connected = threading.Event()
@@ -246,6 +285,16 @@ class TunnelClient:
                     additional_headers=_extra_headers,
                 ) as ws:
                     self._ws = ws
+                    await ws.send(
+                        json.dumps(
+                            hello_frame(
+                                protocol_version=self._protocol_version,
+                                max_stream_chunk=self._max_stream_chunk,
+                                max_inflight=self._max_inflight,
+                                stream_window_frames=self._stream_window_frames,
+                            )
+                        )
+                    )
                     self._connected.set()
                     failures = 0
                     logger.info("TunnelClient connected: %s", tunnel_ws_url)
@@ -254,6 +303,21 @@ class TunnelClient:
                     finally:
                         self._ws = None
                         self._connected.clear()
+                    if self._stopping.is_set():
+                        return
+                    failures += 1
+                    if failures == 1 or failures % 10 == 0:
+                        logger.warning(
+                            "TunnelClient connection ended without a close error "
+                            "(attempt %d); retrying",
+                            failures,
+                        )
+                    # A clean iterator end can still mean a peer rejected a
+                    # frame. Back off here too, otherwise it becomes a tight
+                    # reconnect/replay loop.
+                    await asyncio.sleep(
+                        min(_RECONNECT_DELAY * min(failures, 30), 30)
+                    )
             except (ws_exc.ConnectionClosed, OSError, asyncio.TimeoutError) as e:
                 self._connected.clear()
                 failures += 1
@@ -302,31 +366,37 @@ class TunnelClient:
     async def _proxy_loop(self, ws, http_ssl_context=None) -> None:
         """Relay rrt tunnel frames to/from the upstream HTTP service.
 
-        rrt's tunnel server (Port A) speaks a JSON frame protocol over WS TEXT
-        messages (see api/rust/rrt-daemon/src/runtime/tunnel.rs ``Frame``): an
-        ``http_req`` frame carries a sandbox-side request with a base64 body; we
-        fetch the local upstream and answer with an ``http_resp`` frame keyed by
-        the same id (base64 body). ``ping`` frames are answered with ``pong``
-        (heartbeat). HTTP request frames are handled concurrently so multiple
-        sandbox-side requests can share the same tunnel.
+        RRT's tunnel server (Port A) keeps metadata and small bodies in JSON
+        text frames. After V2 hello negotiation, large HTTP bodies and binary
+        WebSocket messages use bounded raw binary envelopes. ``ping`` frames
+        are answered with ``pong`` (heartbeat), and HTTP forwarding is capped
+        by the negotiated in-flight limit.
         """
         import asyncio
         import base64
-        import json
-
         send_lock = asyncio.Lock()
         inflight: dict = {}
         completed: dict = {}
         ws_channels: dict[str, asyncio.Queue] = {}
+        stream_requests: dict[str, dict[str, Any]] = {}
+        response_credits: dict[str, asyncio.Queue] = {}
         pong_received = asyncio.Event()
         pending_ping_id: str | None = None
         heartbeat_timed_out = asyncio.Event()
+        negotiated_protocol_version = 1
+        negotiated_stream_chunk = self._max_stream_chunk
+        negotiated_max_inflight = self._max_inflight
+        negotiated_stream_window = self._stream_window_frames
 
         async def send_frame(obj: dict) -> None:
             # websockets does not allow concurrent send() from multiple tasks;
             # serialize since http_req frames are handled on their own tasks.
             async with send_lock:
                 await ws.send(json.dumps(obj))
+
+        async def send_binary(envelope: BinaryEnvelope) -> None:
+            async with send_lock:
+                await ws.send(envelope.encode(negotiated_stream_chunk))
 
         async def heartbeat_loop() -> None:
             nonlocal pending_ping_id
@@ -372,7 +442,73 @@ class TunnelClient:
                 oldest = min(completed.items(), key=lambda item: item[1][1])[0]
                 completed.pop(oldest, None)
 
-        async def build_http_resp_frame(client, frame: dict) -> dict:
+        def response_metadata(resp: httpx.Response):
+            response_headers = [
+                (name.decode("ascii"), value.decode("latin-1"))
+                for name, value in resp.headers.raw
+            ]
+            content_length = None
+            for name, value in response_headers:
+                if name.lower() == "content-length":
+                    try:
+                        content_length = int(value)
+                    except ValueError:
+                        pass
+                    break
+            return response_headers, content_length
+
+        async def send_streaming_response(
+            rid: str,
+            resp: httpx.Response,
+            body_expected: bool,
+        ) -> None:
+            response_headers, content_length = response_metadata(resp)
+            if (
+                body_expected
+                and content_length is not None
+                and content_length > self._max_body_size
+            ):
+                raise ProtocolError("response body exceeds tunnel limit")
+            credit_queue: asyncio.Queue = asyncio.Queue(
+                maxsize=negotiated_stream_window
+            )
+            response_credits[rid] = credit_queue
+            try:
+                await send_frame(
+                    {
+                        "type": "http_resp_begin",
+                        "id": rid,
+                        "status": resp.status_code,
+                        "headers": response_headers,
+                        "content_length": content_length,
+                    }
+                )
+                response_size = 0
+                async for raw_chunk in resp.aiter_raw():
+                    response_size += len(raw_chunk)
+                    if response_size > self._max_body_size:
+                        raise ProtocolError("response body exceeds tunnel limit")
+                    for offset in range(0, len(raw_chunk), negotiated_stream_chunk):
+                        await credit_queue.get()
+                        chunk = raw_chunk[offset : offset + negotiated_stream_chunk]
+                        await send_binary(
+                            BinaryEnvelope(
+                                request_id=rid,
+                                kind=BinaryKind.HTTP_RESPONSE_DATA,
+                                payload=chunk,
+                            )
+                        )
+                if (
+                    body_expected
+                    and content_length is not None
+                    and response_size != content_length
+                ):
+                    raise ProtocolError("response content length mismatch")
+                await send_frame({"type": "http_resp_end", "id": rid})
+            finally:
+                response_credits.pop(rid, None)
+
+        async def build_http_resp_frame(client, frame: dict) -> dict | None:
             rid = frame.get("id", "")
             method = frame.get("method", "GET")
             path = frame.get("path", "/")
@@ -389,14 +525,20 @@ class TunnelClient:
                     headers=req_headers or None,
                     content=body,
                 ) as resp:
-                    raw_body = b"".join([chunk async for chunk in resp.aiter_raw()])
-                    response_headers = [
-                        (
-                            name.decode("ascii"),
-                            value.decode("latin-1"),
+                    response_headers, content_length = response_metadata(resp)
+                    if negotiated_protocol_version >= PROTOCOL_VERSION and (
+                        content_length is None
+                        or content_length > self._fast_path_body_bytes
+                    ):
+                        body_expected = method.upper() != "HEAD" and not (
+                            100 <= resp.status_code < 200
+                            or resp.status_code in (204, 304)
                         )
-                        for name, value in resp.headers.raw
-                    ]
+                        await send_streaming_response(rid, resp, body_expected)
+                        return None
+                    raw_body = b"".join([chunk async for chunk in resp.aiter_raw()])
+                    if len(raw_body) > self._max_body_size:
+                        raise ProtocolError("response body exceeds tunnel limit")
                 return {
                     "type": "http_resp",
                     "id": rid,
@@ -408,9 +550,58 @@ class TunnelClient:
                 logger.debug("tunnel http_req upstream error: %s", e)
                 return {"type": "error", "id": rid, "message": str(e)}
 
+        async def stream_http_response(
+            client: httpx.AsyncClient,
+            frame: dict,
+            request_state: dict[str, Any],
+        ) -> None:
+            rid = frame["id"]
+            method = frame.get("method", "GET")
+            path = frame.get("path", "/")
+            request_queue: asyncio.Queue = request_state["queue"]
+
+            async def request_content():
+                while True:
+                    chunk = await request_queue.get()
+                    if chunk is None:
+                        return
+                    yield chunk
+                    await send_frame({"type": "window", "id": rid, "credits": 1})
+
+            try:
+                req_headers = _headers_for_rebuilt_request(frame.get("headers") or [])
+                content_length = request_state["content_length"]
+                if content_length is not None:
+                    req_headers.append(("Content-Length", str(content_length)))
+                base_url = self._upstream
+                if "://" not in base_url:
+                    base_url = f"http://{base_url}"
+                async with client.stream(
+                    method,
+                    urljoin(f"{base_url.rstrip('/')}/", path.lstrip("/")),
+                    headers=req_headers or None,
+                    content=request_content(),
+                ) as resp:
+                    body_expected = method.upper() != "HEAD" and not (
+                        100 <= resp.status_code < 200
+                        or resp.status_code in (204, 304)
+                    )
+                    await send_streaming_response(rid, resp, body_expected)
+            except asyncio.CancelledError:
+                raise
+            except Exception as exc:
+                logger.debug("tunnel streaming request error: %s", exc)
+                try:
+                    await send_frame({"type": "error", "id": rid, "message": str(exc)})
+                except ws_exc.ConnectionClosed:
+                    pass
+            finally:
+                stream_requests.pop(rid, None)
+
         async def await_and_send(rid: str, task) -> None:
             frame = await task
-            await send_frame(frame)
+            if frame is not None:
+                await send_frame(frame)
 
         def handle_http_req(client, frame: dict):
             rid = frame.get("id", "")
@@ -429,13 +620,68 @@ class TunnelClient:
                     inflight.pop(request_id, None)
                     if not t.cancelled():
                         try:
-                            completed[request_id] = (t.result(), time.monotonic())
-                            cleanup_completed()
+                            result = t.result()
+                            if result is not None:
+                                completed[request_id] = (result, time.monotonic())
+                                cleanup_completed()
                         except Exception:
                             pass
 
                 task.add_done_callback(done_callback)
             return asyncio.ensure_future(await_and_send(rid, task))
+
+        async def handle_http_req_begin(client, frame: dict):
+            rid = frame.get("id")
+            if not isinstance(rid, str):
+                raise ProtocolError("streaming request id must be a UUID string")
+            try:
+                uuid.UUID(rid)
+            except ValueError as exc:
+                raise ProtocolError("streaming request id must be a UUID string") from exc
+            if rid in stream_requests:
+                raise ProtocolError(f"duplicate streaming request id: {rid}")
+            content_length = frame.get("content_length")
+            if content_length is not None:
+                if not isinstance(content_length, int) or content_length < 0:
+                    raise ProtocolError("invalid streaming request content_length")
+                if content_length > self._max_body_size:
+                    await send_frame(
+                        {
+                            "type": "error",
+                            "id": rid,
+                            "message": "request body exceeds tunnel limit",
+                        }
+                    )
+                    return None
+            if len(http_tasks) >= negotiated_max_inflight:
+                await send_frame(
+                    {
+                        "type": "error",
+                        "id": rid,
+                        "message": "tunnel max_inflight limit reached",
+                    }
+                )
+                return None
+            request_state: dict[str, Any] = {
+                "queue": asyncio.Queue(maxsize=negotiated_stream_window),
+                "received": 0,
+                "content_length": content_length,
+                "ended": False,
+            }
+            stream_requests[rid] = request_state
+            task = asyncio.create_task(stream_http_response(client, frame, request_state))
+            tasks.add(task)
+            http_tasks.add(task)
+            task.add_done_callback(tasks.discard)
+            task.add_done_callback(http_tasks.discard)
+            await send_frame(
+                {
+                    "type": "window",
+                    "id": rid,
+                    "credits": negotiated_stream_window,
+                }
+            )
+            return task
 
         def websocket_target(path: str) -> str:
             base_url = self._upstream
@@ -480,7 +726,10 @@ class TunnelClient:
                 elif lower not in ignored:
                     additional_headers[key] = value
             options: dict[str, Any] = {
-                "max_size": 2**23,
+                # This is the application WebSocket, whose message limit is
+                # governed by the tunnel's total-body bound. The control
+                # WebSocket remains at 8 MiB because V2 tunnel chunks are small.
+                "max_size": self._max_body_size,
                 "additional_headers": additional_headers or None,
             }
             if origin:
@@ -515,25 +764,70 @@ class TunnelClient:
                     async def from_upstream() -> None:
                         async for upstream_message in upstream_ws:
                             if isinstance(upstream_message, str):
-                                data = upstream_message
-                                binary = False
-                            else:
-                                data = base64.b64encode(upstream_message).decode(
-                                    "ascii"
+                                await send_frame(
+                                    {
+                                        "type": "ws_message",
+                                        "id": rid,
+                                        "data": upstream_message,
+                                        "binary": False,
+                                    }
                                 )
-                                binary = True
-                            await send_frame(
-                                {
-                                    "type": "ws_message",
-                                    "id": rid,
-                                    "data": data,
-                                    "binary": binary,
-                                }
-                            )
+                            elif negotiated_protocol_version >= PROTOCOL_VERSION:
+                                chunks = [b""] if not upstream_message else (
+                                    upstream_message[offset : offset + negotiated_stream_chunk]
+                                    for offset in range(
+                                        0,
+                                        len(upstream_message),
+                                        negotiated_stream_chunk,
+                                    )
+                                )
+                                chunk_count = max(
+                                    1,
+                                    (len(upstream_message) + negotiated_stream_chunk - 1)
+                                    // negotiated_stream_chunk,
+                                )
+                                for index, chunk in enumerate(chunks):
+                                    await send_binary(
+                                        BinaryEnvelope(
+                                            request_id=rid,
+                                            kind=BinaryKind.WS_BINARY_DATA,
+                                            payload=chunk,
+                                            end_of_body=index + 1 == chunk_count,
+                                        )
+                                    )
+                            else:
+                                await send_frame(
+                                    {
+                                        "type": "ws_message",
+                                        "id": rid,
+                                        "data": base64.b64encode(
+                                            upstream_message
+                                        ).decode("ascii"),
+                                        "binary": True,
+                                    }
+                                )
 
                     async def from_sandbox() -> None:
+                        incoming_binary = bytearray()
                         while True:
                             channel_frame = await queue.get()
+                            if isinstance(channel_frame, BinaryEnvelope):
+                                if channel_frame.kind != BinaryKind.WS_BINARY_DATA:
+                                    raise ProtocolError(
+                                        "unexpected binary kind for WebSocket channel"
+                                    )
+                                if (
+                                    len(incoming_binary) + len(channel_frame.payload)
+                                    > self._max_body_size
+                                ):
+                                    raise ProtocolError(
+                                        "WebSocket binary message exceeds tunnel limit"
+                                    )
+                                incoming_binary.extend(channel_frame.payload)
+                                if channel_frame.end_of_body:
+                                    await upstream_ws.send(bytes(incoming_binary))
+                                    incoming_binary.clear()
+                                continue
                             frame_type = channel_frame.get("type")
                             if frame_type == "ws_message":
                                 data = channel_frame.get("data", "")
@@ -586,6 +880,7 @@ class TunnelClient:
 
         limits = httpx.Limits(max_keepalive_connections=5, max_connections=10)
         tasks: set = set()
+        http_tasks: set = set()
         heartbeat_task = asyncio.create_task(heartbeat_loop())
         try:
             verify = http_ssl_context if http_ssl_context is not None else True
@@ -599,20 +894,142 @@ class TunnelClient:
                 async for message in ws:
                     if self._stopping.is_set():
                         break
-                    text = (
-                        message.decode("utf-8", "replace")
-                        if isinstance(message, bytes)
-                        else message
-                    )
+                    if isinstance(message, bytes):
+                        envelope = BinaryEnvelope.decode(
+                            message,
+                            max_payload=negotiated_stream_chunk,
+                        )
+                        if envelope.kind == BinaryKind.WS_BINARY_DATA:
+                            channel = ws_channels.get(envelope.request_id)
+                            if channel is None:
+                                raise ProtocolError(
+                                    "WebSocket data for unknown channel: "
+                                    f"{envelope.request_id}"
+                                )
+                            await channel.put(envelope)
+                            continue
+                        if envelope.kind != BinaryKind.HTTP_REQUEST_DATA:
+                            raise ProtocolError(
+                                f"unexpected binary frame kind: {envelope.kind.name}"
+                            )
+                        rid = envelope.request_id
+                        request_state = stream_requests.get(rid)
+                        if request_state is None:
+                            raise ProtocolError(
+                                f"request data for unknown stream: {rid}"
+                            )
+                        if request_state["ended"]:
+                            raise ProtocolError(
+                                f"request data after end of stream: {rid}"
+                            )
+                        total = request_state["received"] + len(envelope.payload)
+                        if total > self._max_body_size:
+                            raise ProtocolError(
+                                f"request body exceeds tunnel limit: {rid}"
+                            )
+                        request_state["received"] = total
+                        try:
+                            request_state["queue"].put_nowait(envelope.payload)
+                        except asyncio.QueueFull as exc:
+                            raise ProtocolError(
+                                f"request stream exceeded advertised window: {rid}"
+                            ) from exc
+                        if envelope.end_of_body:
+                            request_state["ended"] = True
+                            await request_state["queue"].put(None)
+                        continue
+                    text = message
                     try:
                         frame = json.loads(text)
                     except (ValueError, TypeError):
                         continue
                     ftype = frame.get("type")
-                    if ftype == "http_req":
+                    if ftype == "hello":
+                        peer_version = frame.get("protocol_version")
+                        peer_chunk = frame.get("max_stream_chunk")
+                        peer_inflight = frame.get("max_inflight")
+                        peer_window = frame.get("stream_window_frames")
+                        if (
+                            self._protocol_version >= PROTOCOL_VERSION
+                            and isinstance(peer_version, int)
+                            and peer_version >= PROTOCOL_VERSION
+                            and isinstance(peer_chunk, int)
+                            and peer_chunk > 0
+                            and isinstance(peer_inflight, int)
+                            and peer_inflight > 0
+                            and isinstance(peer_window, int)
+                            and peer_window > 0
+                        ):
+                            negotiated_protocol_version = PROTOCOL_VERSION
+                            negotiated_stream_chunk = min(
+                                self._max_stream_chunk, peer_chunk
+                            )
+                            negotiated_max_inflight = min(
+                                self._max_inflight, peer_inflight
+                            )
+                            negotiated_stream_window = min(
+                                self._stream_window_frames, peer_window
+                            )
+                            logger.info(
+                                "TunnelClient protocol v%d negotiated "
+                                "chunk=%d inflight=%d window=%d",
+                                negotiated_protocol_version,
+                                negotiated_stream_chunk,
+                                negotiated_max_inflight,
+                                negotiated_stream_window,
+                            )
+                    elif ftype == "http_req":
+                        rid = frame.get("id", "")
+                        is_existing = rid in inflight or rid in completed
+                        if not is_existing and len(http_tasks) >= negotiated_max_inflight:
+                            await send_frame(
+                                {
+                                    "type": "error",
+                                    "id": rid,
+                                    "message": "tunnel max_inflight limit reached",
+                                }
+                            )
+                            continue
                         t = handle_http_req(client, frame)
                         tasks.add(t)
+                        http_tasks.add(t)
                         t.add_done_callback(tasks.discard)
+                        t.add_done_callback(http_tasks.discard)
+                    elif ftype == "http_req_begin":
+                        if negotiated_protocol_version < PROTOCOL_VERSION:
+                            raise ProtocolError(
+                                "received streaming request before V2 negotiation"
+                            )
+                        await handle_http_req_begin(client, frame)
+                    elif ftype == "http_req_end":
+                        rid = frame.get("id", "")
+                        request_state = stream_requests.get(rid)
+                        if request_state is None:
+                            raise ProtocolError(
+                                f"request end for unknown stream: {rid}"
+                            )
+                        if request_state["ended"]:
+                            raise ProtocolError(f"duplicate request end: {rid}")
+                        expected = request_state["content_length"]
+                        if expected is not None and expected != request_state["received"]:
+                            raise ProtocolError(
+                                f"request content length mismatch for stream: {rid}"
+                            )
+                        request_state["ended"] = True
+                        await request_state["queue"].put(None)
+                    elif ftype == "window":
+                        rid = frame.get("id", "")
+                        credits = frame.get("credits")
+                        if not isinstance(credits, int) or credits <= 0:
+                            raise ProtocolError("window credits must be a positive integer")
+                        credit_queue = response_credits.get(rid)
+                        if credit_queue is None:
+                            continue
+                        for _ in range(min(credits, negotiated_stream_window)):
+                            try:
+                                credit_queue.put_nowait(None)
+                            except asyncio.QueueFull:
+                                break
                     elif ftype == "ws_connect":
                         t = asyncio.create_task(handle_ws_connect(frame))
                         tasks.add(t)
@@ -645,5 +1062,7 @@ class TunnelClient:
             if tasks:
                 await asyncio.gather(*tasks, return_exceptions=True)
             ws_channels.clear()
+            stream_requests.clear()
+            response_credits.clear()
         if heartbeat_timed_out.is_set():
             raise asyncio.TimeoutError("TunnelClient application heartbeat timed out")
