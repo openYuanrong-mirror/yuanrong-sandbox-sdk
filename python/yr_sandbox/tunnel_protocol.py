@@ -15,10 +15,12 @@ PROTOCOL_VERSION = 2
 BINARY_ENVELOPE_VERSION = 1
 BINARY_MAGIC = b"YD"
 DEFAULT_STREAM_CHUNK_BYTES = 64 * 1024
+MIN_STREAM_CHUNK_BYTES = 1024
 DEFAULT_FAST_PATH_BODY_BYTES = 64 * 1024
 DEFAULT_MAX_INFLIGHT = 16
 DEFAULT_STREAM_WINDOW_FRAMES = 16
 DEFAULT_MAX_BODY_BYTES = 512 * 1024 * 1024
+DEFAULT_MAX_WS_MESSAGE_BYTES = 1024 * 1024
 MAX_V1_BODY_BYTES = 5 * 1024 * 1024
 _END_OF_BODY = 0x01
 _UUID_BYTES = 16
@@ -114,17 +116,20 @@ def hello_frame(
     max_inflight: int = DEFAULT_MAX_INFLIGHT,
     stream_window_frames: int = DEFAULT_STREAM_WINDOW_FRAMES,
     max_body_size: int = DEFAULT_MAX_BODY_BYTES,
+    max_ws_message_size: int = DEFAULT_MAX_WS_MESSAGE_BYTES,
 ) -> dict:
     if protocol_version <= 0:
         raise ValueError("protocol_version must be greater than zero")
-    if max_stream_chunk <= 0:
-        raise ValueError("max_stream_chunk must be greater than zero")
+    if max_stream_chunk < MIN_STREAM_CHUNK_BYTES:
+        raise ValueError("max_stream_chunk must be at least 1024 bytes")
     if max_inflight <= 0:
         raise ValueError("max_inflight must be greater than zero")
     if stream_window_frames <= 0:
         raise ValueError("stream_window_frames must be greater than zero")
     if max_body_size <= 0:
         raise ValueError("max_body_size must be greater than zero")
+    if max_ws_message_size <= 0:
+        raise ValueError("max_ws_message_size must be greater than zero")
     return {
         "type": "hello",
         "protocol_version": protocol_version,
@@ -132,4 +137,5 @@ def hello_frame(
         "max_inflight": max_inflight,
         "stream_window_frames": stream_window_frames,
         "max_body_size": max_body_size,
+        "max_ws_message_size": max_ws_message_size,
     }

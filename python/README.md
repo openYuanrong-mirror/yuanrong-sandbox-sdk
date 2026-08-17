@@ -104,16 +104,23 @@ enables it.
 | `YR_GATEWAY_TLS` | Set `1/true/yes` to use WSS for gateway tunnel routes. Default: `0`. |
 | `YR_TUNNEL_CONNECT_TIMEOUT` | Reverse tunnel WebSocket connection wait in seconds. Default: `60`. |
 | `YR_TUNNEL_PROTOCOL_VERSION` | Highest reverse-tunnel protocol version to advertise. Default/cap: `2`. |
-| `YR_TUNNEL_MAX_BODY_SIZE` | Per-request, response, or WebSocket-message bound advertised to the peer. Default: `512 MiB`; cap: `1 GiB`. |
-| `YR_TUNNEL_STREAM_CHUNK_BYTES` | V2 binary-frame payload bound. Default: `64 KiB`; cap: `1 MiB` and the body bound. |
+| `YR_TUNNEL_MAX_BODY_SIZE` | Per-request or response HTTP body bound advertised to the peer. HTTP bodies are streamed. Default: `512 MiB`; cap: `1 GiB`. |
+| `YR_TUNNEL_MAX_WS_MESSAGE_SIZE` | Per-message application WebSocket bound advertised separately because each message is reassembled. Default: `1 MiB`; cap: `8 MiB`. Use application-level chunking for larger payloads. |
+| `YR_TUNNEL_STREAM_CHUNK_BYTES` | V2 binary-frame payload bound. Default/cap: `64 KiB`; minimum: `1 KiB`. The fixed cap keeps the global 480-frame data budget below `30 MiB`. |
 | `YR_TUNNEL_MAX_INFLIGHT` | Concurrent tunnel HTTP work bound. Default: `16`; cap: `1024`. |
 | `YR_TUNNEL_STREAM_WINDOW_FRAMES` | Per-stream credit window and request queue bound. Default: `16`; cap: `1024`, further reduced so all negotiated HTTP windows fit the fixed outbound frame budget. |
-| `YR_TUNNEL_FAST_PATH_BODY_BYTES` | Largest request/response kept on the small JSON fast path after V2 negotiation. Default: `64 KiB`; capped by the body bound. |
+| `YR_TUNNEL_FAST_PATH_BODY_BYTES` | Largest request/response kept on the small JSON fast path after V2 negotiation. Default: `64 KiB`; capped at the V1-safe `5 MiB` control-frame bound. |
 | `YR_SANDBOX_CREATE_TIMEOUT` | Sandbox end-to-end create budget in seconds. Default: `60`; must be greater than the 30-second scheduling buffer. |
 
 Tunnel limits are process-local, optional overrides. The SDK and rrt-runtime
 advertise their values in `hello` and use the lower value, so existing AKernel
 sandbox creation does not need to inject matching variables for the defaults.
+HTTP body and application WebSocket message limits are negotiated separately:
+large HTTP bodies stay streaming, while a WebSocket message is reassembled and
+therefore uses the lower bounded limit.
+Text WebSocket messages also have to fit the fixed `8 MiB` JSON control frame;
+oversized/escape-expanded text is rejected on that channel without resetting
+the tunnel. Large payload protocols should use application-level binary chunks.
 
 ## Build
 

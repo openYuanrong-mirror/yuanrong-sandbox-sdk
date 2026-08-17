@@ -77,11 +77,18 @@ class HelloFrameTests(unittest.TestCase):
                 "max_inflight": 16,
                 "stream_window_frames": 16,
                 "max_body_size": 536870912,
+                "max_ws_message_size": 1048576,
             },
         )
 
     def test_hello_can_explicitly_advertise_v1_for_rollout_fallback(self):
         self.assertEqual(hello_frame(protocol_version=1)["protocol_version"], 1)
+
+    def test_hello_rejects_pathological_chunk_and_ws_limits(self):
+        with self.assertRaisesRegex(ValueError, "at least 1024"):
+            hello_frame(max_stream_chunk=1)
+        with self.assertRaisesRegex(ValueError, "max_ws_message_size"):
+            hello_frame(max_ws_message_size=0)
 
 
 if __name__ == "__main__":

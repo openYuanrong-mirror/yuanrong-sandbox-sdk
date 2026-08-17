@@ -38,9 +38,11 @@ from .tunnel_protocol import (
     DEFAULT_FAST_PATH_BODY_BYTES,
     DEFAULT_MAX_BODY_BYTES,
     DEFAULT_MAX_INFLIGHT,
+    DEFAULT_MAX_WS_MESSAGE_BYTES,
     DEFAULT_STREAM_CHUNK_BYTES,
     DEFAULT_STREAM_WINDOW_FRAMES,
     MAX_V1_BODY_BYTES,
+    MIN_STREAM_CHUNK_BYTES,
     PROTOCOL_VERSION,
     ProtocolError,
     hello_frame,
@@ -55,13 +57,16 @@ _ROUTE_404_WARNING_THRESHOLD = 5
 _ROUTE_404_WARNING_INTERVAL = 10
 _COMPLETED_FRAME_TTL = 300.0
 _COMPLETED_FRAME_LIMIT = 1024
+_COMPLETED_FRAME_BYTES_LIMIT = 16 * 1024 * 1024
 _WS_CHANNEL_QUEUE_LIMIT = 100
 _MAX_CONFIGURED_BODY_BYTES = 1024 * 1024 * 1024
-_MAX_CONFIGURED_STREAM_CHUNK_BYTES = 1024 * 1024
+_MAX_CONFIGURED_WS_MESSAGE_BYTES = 8 * 1024 * 1024
+_MAX_CONFIGURED_STREAM_CHUNK_BYTES = 64 * 1024
 _MAX_CONFIGURED_INFLIGHT = 1024
 _MAX_CONFIGURED_WINDOW_FRAMES = 1024
 _OUTBOUND_QUEUE_FRAMES = 512
 _OUTBOUND_CONTROL_RESERVE = 32
+_CONTROL_WS_MESSAGE_BYTES = 8 * 1024 * 1024
 _HOP_BY_HOP_HEADERS = frozenset(
     {
         "connection",
@@ -86,6 +91,11 @@ def _positive_int_env(name: str, default: int, maximum: int) -> int:
     if value <= 0:
         raise ValueError(f"{name} must be greater than zero")
     return min(value, maximum)
+
+
+def _http_timeout_for_tunnel() -> httpx.Timeout:
+    """Bound setup/write waits without breaking an idle streaming response."""
+    return httpx.Timeout(60.0, read=None)
 
 
 def _headers_for_rebuilt_request(headers):
@@ -185,13 +195,18 @@ class TunnelClient:
             DEFAULT_MAX_BODY_BYTES,
             _MAX_CONFIGURED_BODY_BYTES,
         )
-        self._max_stream_chunk = min(
+        self._max_ws_message_size = _positive_int_env(
+            "YR_TUNNEL_MAX_WS_MESSAGE_SIZE",
+            DEFAULT_MAX_WS_MESSAGE_BYTES,
+            _MAX_CONFIGURED_WS_MESSAGE_BYTES,
+        )
+        self._max_stream_chunk = max(
+            MIN_STREAM_CHUNK_BYTES,
             _positive_int_env(
                 "YR_TUNNEL_STREAM_CHUNK_BYTES",
                 DEFAULT_STREAM_CHUNK_BYTES,
                 _MAX_CONFIGURED_STREAM_CHUNK_BYTES,
             ),
-            self._max_body_size,
         )
         self._max_inflight = _positive_int_env(
             "YR_TUNNEL_MAX_INFLIGHT", DEFAULT_MAX_INFLIGHT, _MAX_CONFIGURED_INFLIGHT
@@ -204,7 +219,7 @@ class TunnelClient:
         self._fast_path_body_bytes = _positive_int_env(
             "YR_TUNNEL_FAST_PATH_BODY_BYTES",
             DEFAULT_FAST_PATH_BODY_BYTES,
-            self._max_body_size,
+            min(self._max_body_size, MAX_V1_BODY_BYTES),
         )
         self._loop: Optional[asyncio.AbstractEventLoop] = None
         self._thread: Optional[threading.Thread] = None
@@ -301,7 +316,7 @@ class TunnelClient:
                         )
                 async with ws_client.connect(
                     connect_url,
-                    max_size=2**23,
+                    max_size=_CONTROL_WS_MESSAGE_BYTES,
                     # Use JSON application frames for the tunnel heartbeat.
                     # Some gateways don't count WebSocket control frames as
                     # activity and close otherwise healthy idle tunnels.
@@ -320,6 +335,7 @@ class TunnelClient:
                                 max_inflight=self._max_inflight,
                                 stream_window_frames=self._stream_window_frames,
                                 max_body_size=self._max_body_size,
+                                max_ws_message_size=self._max_ws_message_size,
                             )
                         )
                     )
@@ -417,12 +433,16 @@ class TunnelClient:
         negotiated_max_inflight = self._max_inflight
         negotiated_stream_window = self._stream_window_frames
         negotiated_max_body_size = self._max_body_size
+        negotiated_max_ws_message_size = self._max_ws_message_size
 
         async def send_frame(obj: dict) -> None:
             # websockets does not allow concurrent send() from multiple tasks;
             # serialize since http_req frames are handled on their own tasks.
+            raw = json.dumps(obj)
+            if len(raw.encode("utf-8")) > _CONTROL_WS_MESSAGE_BYTES:
+                raise ProtocolError("tunnel control frame exceeds 8 MiB limit")
             async with send_lock:
-                await ws.send(json.dumps(obj))
+                await ws.send(raw)
 
         async def send_binary(envelope: BinaryEnvelope) -> None:
             async with send_lock:
@@ -460,6 +480,12 @@ class TunnelClient:
                     return
 
         def cleanup_completed() -> None:
+            def cached_frame_bytes(frame: dict) -> int:
+                headers = frame.get("headers") or []
+                return len(frame.get("body", "")) + sum(
+                    len(name) + len(value) for name, value in headers
+                )
+
             now = time.monotonic()
             expired = [
                 rid
@@ -468,9 +494,16 @@ class TunnelClient:
             ]
             for rid in expired:
                 completed.pop(rid, None)
-            while len(completed) > _COMPLETED_FRAME_LIMIT:
+            cached_bytes = sum(
+                cached_frame_bytes(frame) for frame, _ in completed.values()
+            )
+            while (
+                len(completed) > _COMPLETED_FRAME_LIMIT
+                or cached_bytes > _COMPLETED_FRAME_BYTES_LIMIT
+            ):
                 oldest = min(completed.items(), key=lambda item: item[1][1])[0]
-                completed.pop(oldest, None)
+                evicted, _ = completed.pop(oldest)
+                cached_bytes -= cached_frame_bytes(evicted)
 
         def remember_terminated(rid: str) -> None:
             now = time.monotonic()
@@ -794,11 +827,11 @@ class TunnelClient:
                 elif lower not in ignored:
                     additional_headers[key] = value
             options: dict[str, Any] = {
-                # This is the application WebSocket, whose message limit is
-                # governed by the tunnel's total-body bound. The control
-                # WebSocket remains at 8 MiB because V2 tunnel chunks are small.
+                # Application WebSocket messages are reassembled before being
+                # forwarded, so they have an independent bounded limit. HTTP
+                # bodies remain streaming and use negotiated_max_body_size.
                 "max_size": (
-                    negotiated_max_body_size
+                    negotiated_max_ws_message_size
                     if negotiated_protocol_version >= PROTOCOL_VERSION
                     else min(negotiated_max_body_size, MAX_V1_BODY_BYTES)
                 ),
@@ -831,6 +864,10 @@ class TunnelClient:
                                     }
                                 )
                             elif negotiated_protocol_version >= PROTOCOL_VERSION:
+                                if len(upstream_message) > negotiated_max_ws_message_size:
+                                    raise ProtocolError(
+                                        "WebSocket binary message exceeds tunnel limit"
+                                    )
                                 chunks = (
                                     [b""]
                                     if not upstream_message
@@ -886,7 +923,7 @@ class TunnelClient:
                                     )
                                 if (
                                     len(incoming_binary) + len(channel_frame.payload)
-                                    > negotiated_max_body_size
+                                    > negotiated_max_ws_message_size
                                 ):
                                     raise ProtocolError(
                                         "WebSocket binary message exceeds tunnel limit"
@@ -902,7 +939,7 @@ class TunnelClient:
                                 if channel_frame.get("binary", False):
                                     data = base64.b64decode(data, validate=True)
                                     ws_body_limit = (
-                                        negotiated_max_body_size
+                                        negotiated_max_ws_message_size
                                         if negotiated_protocol_version
                                         >= PROTOCOL_VERSION
                                         else min(
@@ -971,7 +1008,7 @@ class TunnelClient:
             verify = http_ssl_context if http_ssl_context is not None else True
             async with httpx.AsyncClient(
                 limits=limits,
-                timeout=httpx.Timeout(60.0),
+                timeout=_http_timeout_for_tunnel(),
                 verify=verify,
                 trust_env=False,
                 cookies=_NoCookieJar(),
@@ -1076,23 +1113,31 @@ class TunnelClient:
                         continue
                     ftype = frame.get("type")
                     if ftype == "hello":
+                        if negotiated_protocol_version >= PROTOCOL_VERSION:
+                            logger.warning("TunnelClient ignored duplicate hello")
+                            continue
                         peer_version = frame.get("protocol_version")
                         peer_chunk = frame.get("max_stream_chunk")
                         peer_inflight = frame.get("max_inflight")
                         peer_window = frame.get("stream_window_frames")
                         peer_max_body = frame.get("max_body_size", self._max_body_size)
+                        peer_max_ws_message = frame.get(
+                            "max_ws_message_size", self._max_ws_message_size
+                        )
                         if (
                             self._protocol_version >= PROTOCOL_VERSION
                             and isinstance(peer_version, int)
                             and peer_version >= PROTOCOL_VERSION
                             and isinstance(peer_chunk, int)
-                            and peer_chunk > 0
+                            and peer_chunk >= MIN_STREAM_CHUNK_BYTES
                             and isinstance(peer_inflight, int)
                             and peer_inflight > 0
                             and isinstance(peer_window, int)
                             and peer_window > 0
                             and isinstance(peer_max_body, int)
                             and peer_max_body > 0
+                            and isinstance(peer_max_ws_message, int)
+                            and peer_max_ws_message > 0
                         ):
                             negotiated_protocol_version = PROTOCOL_VERSION
                             negotiated_stream_chunk = min(
@@ -1115,18 +1160,18 @@ class TunnelClient:
                             negotiated_max_body_size = min(
                                 self._max_body_size, peer_max_body
                             )
-                            negotiated_stream_chunk = min(
-                                negotiated_stream_chunk,
-                                negotiated_max_body_size,
+                            negotiated_max_ws_message_size = min(
+                                self._max_ws_message_size, peer_max_ws_message
                             )
                             logger.info(
                                 "TunnelClient protocol v%d negotiated "
-                                "chunk=%d inflight=%d window=%d body=%d",
+                                "chunk=%d inflight=%d window=%d body=%d ws_message=%d",
                                 negotiated_protocol_version,
                                 negotiated_stream_chunk,
                                 negotiated_max_inflight,
                                 negotiated_stream_window,
                                 negotiated_max_body_size,
+                                negotiated_max_ws_message_size,
                             )
                     elif ftype == "http_req":
                         rid = frame.get("id", "")
@@ -1246,9 +1291,17 @@ class TunnelClient:
                                 }
                             )
                             continue
-                        channel: asyncio.Queue = asyncio.Queue(
-                            maxsize=_WS_CHANNEL_QUEUE_LIMIT
+                        ws_message_frames = (
+                            negotiated_max_ws_message_size
+                            + negotiated_stream_chunk
+                            - 1
+                        ) // negotiated_stream_chunk
+                        channel_limit = (
+                            ws_message_frames + 2
+                            if negotiated_protocol_version >= PROTOCOL_VERSION
+                            else _WS_CHANNEL_QUEUE_LIMIT
                         )
+                        channel: asyncio.Queue = asyncio.Queue(maxsize=channel_limit)
                         ws_channels[rid] = channel
                         t = asyncio.create_task(handle_ws_connect(frame, channel))
                         ws_tasks[rid] = t
