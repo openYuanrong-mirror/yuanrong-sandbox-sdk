@@ -104,7 +104,7 @@ enables it.
 | `YR_GATEWAY_TLS` | Set `1/true/yes` to use WSS for gateway tunnel routes. Default: `0`. |
 | `YR_TUNNEL_CONNECT_TIMEOUT` | Reverse tunnel WebSocket connection wait in seconds. Default: `60`. |
 | `YR_TUNNEL_PROTOCOL_VERSION` | Highest reverse-tunnel protocol version to advertise. Default/cap: `2`. |
-| `YR_TUNNEL_MAX_BODY_SIZE` | Per-request, response, or WebSocket-message bound advertised to the peer. Default: `64 MiB`; cap: `1 GiB`. |
+| `YR_TUNNEL_MAX_BODY_SIZE` | Per-request, response, or WebSocket-message bound advertised to the peer. Default: `512 MiB`; cap: `1 GiB`. |
 | `YR_TUNNEL_STREAM_CHUNK_BYTES` | V2 binary-frame payload bound. Default: `64 KiB`; cap: `1 MiB` and the body bound. |
 | `YR_TUNNEL_MAX_INFLIGHT` | Concurrent tunnel HTTP work bound. Default: `16`; cap: `1024`. |
 | `YR_TUNNEL_STREAM_WINDOW_FRAMES` | Per-stream credit window and request queue bound. Default: `16`; cap: `1024`, further reduced so all negotiated HTTP windows fit the fixed outbound frame budget. |
