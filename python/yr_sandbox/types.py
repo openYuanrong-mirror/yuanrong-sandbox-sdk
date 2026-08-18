@@ -1,3 +1,4 @@
+import os
 import re
 from dataclasses import dataclass, field
 from typing import Any, Dict, Mapping, Optional, Tuple
@@ -12,6 +13,91 @@ YR_GET_TIMEOUT_BUFFER = 30
 
 
 _DNS_LABEL_PATTERN = re.compile(r"^[a-z0-9_-]+$")
+
+
+def _connection_env(name: str) -> str:
+    value = os.environ.get(name, "").strip()
+    if not value:
+        raise RuntimeError(f"{name} is not set")
+    return value
+
+
+def _connection_env_flag(name: str, default: bool) -> bool:
+    raw = os.environ.get(name, "1" if default else "0")
+    return raw.strip().lower() not in ("0", "false", "no")
+
+
+@dataclass(frozen=True)
+class ConnectionConfig:
+    """Connection settings shared by all transports for one sandbox.
+
+    Passing this object to :class:`yr_sandbox.Sandbox` avoids process-global
+    ``YR_*`` connection state. :meth:`from_env` preserves the environment-based
+    configuration used by existing callers.
+
+    ``server_address`` and ``use_tls`` select the frontend control plane.
+    ``gateway_address`` selects tunnel, user-port, and PTY routes and falls back
+    to ``server_address`` when omitted. ``gateway_use_tls`` selects WSS for the
+    reverse tunnel and for PTY when a separate gateway is configured.
+    ``verify_tls`` controls frontend HTTP certificate verification.
+    """
+
+    server_address: str
+    token: str = field(repr=False)
+    use_tls: bool = True
+    gateway_address: Optional[str] = None
+    gateway_use_tls: bool = False
+    verify_tls: bool = False
+
+    def __post_init__(self) -> None:
+        for field_name in ("server_address", "token"):
+            value = getattr(self, field_name)
+            if not isinstance(value, str) or not value.strip():
+                raise ValueError(f"{field_name} must be a non-empty string")
+        object.__setattr__(
+            self,
+            "server_address",
+            self.server_address.strip().rstrip("/"),
+        )
+        if not self.server_address:
+            raise ValueError("server_address must be a non-empty string")
+        object.__setattr__(self, "token", self.token.strip())
+        if self.gateway_address is not None:
+            if (
+                not isinstance(self.gateway_address, str)
+                or not self.gateway_address.strip()
+            ):
+                raise ValueError("gateway_address must be a non-empty string")
+            object.__setattr__(
+                self,
+                "gateway_address",
+                self.gateway_address.strip().rstrip("/"),
+            )
+            if not self.gateway_address:
+                raise ValueError("gateway_address must be a non-empty string")
+        for field_name in ("use_tls", "gateway_use_tls", "verify_tls"):
+            if not isinstance(getattr(self, field_name), bool):
+                raise TypeError(f"{field_name} must be a boolean")
+
+    @classmethod
+    def from_env(
+        cls,
+        *,
+        server_address: Optional[str] = None,
+        token: Optional[str] = None,
+        verify_tls: bool = False,
+    ) -> "ConnectionConfig":
+        """Build a snapshot of the current ``YR_*`` connection settings."""
+
+        gateway_address = os.environ.get("YR_GATEWAY_ADDRESS", "").strip()
+        return cls(
+            server_address=server_address or _connection_env("YR_SERVER_ADDRESS"),
+            token=token or _connection_env("YR_TOKEN"),
+            use_tls=_connection_env_flag("YR_TLS", True),
+            gateway_address=gateway_address or None,
+            gateway_use_tls=_connection_env_flag("YR_GATEWAY_TLS", False),
+            verify_tls=verify_tls,
+        )
 
 
 def _normalize_dns_pattern(pattern: str) -> str:

@@ -38,7 +38,8 @@ PYTHON=python3 bash build.sh /tmp/openyuanrong-sandbox-dist
 All language SDKs should keep the same user-facing concepts:
 
 - `Sandbox` lifecycle: create, command execution, filesystem operations, kill.
-- Configuration from environment: `YR_SERVER_ADDRESS`, `YR_TOKEN`, optional
+- Python callers may pass an explicit `ConnectionConfig`; all SDKs retain
+  environment fallback through `YR_SERVER_ADDRESS`, `YR_TOKEN`, optional
   `YR_GATEWAY_ADDRESS`, and TLS flags.
 - Frontend control plane: `/api/sandbox/v1/sandboxes`.
 - Direct file and action data plane through `/direct/...`, plus reverse tunnel
@@ -53,6 +54,11 @@ of exposing runtime-internal ports to users. The detailed platform reference is
 maintained in the main yuanrong workspace at `docs/features/sandbox-rest-api.md`.
 
 ### Environment and auth
+
+The Python SDK accepts the same values as an immutable `ConnectionConfig` on
+`Sandbox`, `Sandbox.delete`, and `resources`. Explicit configuration is kept on
+the SDK objects and does not read or modify process-global `YR_*` connection
+variables. Omitting it preserves the environment-based behavior below.
 
 | Setting | Meaning |
 | --- | --- |

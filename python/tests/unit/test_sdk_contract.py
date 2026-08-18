@@ -4,6 +4,7 @@ import unittest
 from unittest.mock import patch
 
 from yr_sandbox import (
+    ConnectionConfig,
     PortForwarding,
     NetworkPolicy,
     S3Config,
@@ -16,10 +17,11 @@ from yr_sandbox.shell import Shells
 class _FakeClient:
     created = []
 
-    def __init__(self):
+    def __init__(self, *, connection=None):
         self.calls = []
         self.closed = False
         self.direct_enabled = True
+        self.connection = connection
 
     def create_info(self, body):
         type(self).created.append(dict(body))
@@ -62,6 +64,10 @@ class _FakeClient:
     def close(self):
         self.closed = True
 
+    @staticmethod
+    def _safe_id(sandbox_id):
+        return sandbox_id
+
 
 class SDKContractTests(unittest.TestCase):
     def setUp(self):
@@ -87,6 +93,31 @@ class SDKContractTests(unittest.TestCase):
         self.assertEqual(
             sandbox._client.calls[-1][2]["cwd"],
             "/workspace",
+        )
+
+    def test_explicit_connection_config_is_shared_without_environment_state(self):
+        connection = ConnectionConfig(
+            server_address="frontend.example:443",
+            token="secret",
+            use_tls=True,
+            gateway_address="gateway.example:8080",
+        )
+        with (
+            patch("yr_sandbox.sandbox_api.SandboxClient", _FakeClient),
+            patch.dict("os.environ", {}, clear=True),
+        ):
+            sandbox = Sandbox(
+                image="ubuntu:22.04",
+                port_forwardings=[8080],
+                connection=connection,
+                detached=True,
+            )
+
+        self.assertIs(sandbox._client.connection, connection)
+        self.assertIs(sandbox.pty._connection_config, connection)
+        self.assertEqual(
+            sandbox.get_port_url(8080),
+            "http://gateway.example:8080/sandbox-1/8080",
         )
 
     def test_sandbox_forwards_runtime_without_owning_runtime_registry(self):

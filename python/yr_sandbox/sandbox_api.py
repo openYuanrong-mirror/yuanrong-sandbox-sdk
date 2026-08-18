@@ -18,6 +18,7 @@ from .filesystem import Filesystem
 from .pty import Pty
 from .shell import Shells
 from .types import (
+    ConnectionConfig,
     Mount,
     NetworkPolicy,
     PortForwarding,
@@ -115,6 +116,27 @@ def _compose_gateway_url(*, gateway: str, scheme: str, path: str) -> str:
     return f"{scheme}://{gateway}{route}"
 
 
+def _gateway_address(connection: Optional[ConnectionConfig]) -> str:
+    if connection is not None:
+        return connection.gateway_address or connection.server_address
+    gateway = os.environ.get("YR_GATEWAY_ADDRESS", "").strip()
+    if not gateway:
+        gateway = os.environ.get("YR_SERVER_ADDRESS", "").strip()
+    if not gateway:
+        raise ValueError("YR_GATEWAY_ADDRESS or YR_SERVER_ADDRESS must be set")
+    return gateway
+
+
+def _gateway_uses_tls(connection: Optional[ConnectionConfig]) -> bool:
+    if connection is not None:
+        return connection.gateway_use_tls
+    return os.environ.get("YR_GATEWAY_TLS", "0").strip().lower() in (
+        "1",
+        "true",
+        "yes",
+    )
+
+
 def _validate_xpu(xpu: Optional[str]) -> None:
     if xpu is None:
         return
@@ -179,6 +201,7 @@ class Sandbox:
         storage_mb: Optional[int] = None,
         network: Optional[NetworkPolicy] = None,
         create_timeout: Optional[int] = None,
+        connection: Optional[ConnectionConfig] = None,
         extra_config: Optional[Dict[str, Any]] = None,
     ):
         """Create a new sandbox.
@@ -216,6 +239,8 @@ class Sandbox:
                 ``None`` uses the cluster default.
             network: Optional creation-time network policy. Omitting it allows
                 unrestricted network access.
+            connection: Explicit frontend and gateway connection settings.
+                Omitting it reads the existing ``YR_*`` environment variables.
             extra_config: Extra sandbox-side configuration forwarded to sandboxd.
         """
         if image is not None and (
@@ -258,6 +283,8 @@ class Sandbox:
                 raise ValueError("storage_mb must be greater than 0")
         if network is not None and not isinstance(network, NetworkPolicy):
             raise TypeError("network must be a NetworkPolicy or None")
+        if connection is not None and not isinstance(connection, ConnectionConfig):
+            raise TypeError("connection must be a ConnectionConfig or None")
         if mounts is None:
             mount_list: List[Mount] = []
         else:
@@ -392,7 +419,11 @@ class Sandbox:
         # ── ports: user port_forwardings only ─────────────────────────────
         # Frontend owns RRT_HTTP_PORT=50090 and its sandbox network mapping for
         # /direct. SDK callers should not expose that internal control port.
-        self._client = SandboxClient()
+        if connection is None:
+            self._client = SandboxClient()
+        else:
+            self._client = SandboxClient(connection=connection)
+        self._connection = connection
         if pf_ports:
             body["ports"] = pf_ports
 
@@ -410,9 +441,7 @@ class Sandbox:
             if upstream is not None:
                 # Build the tunnel WebSocket URL via the sandbox gateway.
                 # The route owns the internal tunnel control-port mapping.
-                gateway = os.environ.get("YR_GATEWAY_ADDRESS", "").strip()
-                if not gateway:
-                    gateway = os.environ.get("YR_SERVER_ADDRESS", "").strip()
+                gateway = _gateway_address(self._connection)
 
                 tunnel_info = create_info.get("tunnel") or {}
                 if not isinstance(tunnel_info, dict):
@@ -423,11 +452,7 @@ class Sandbox:
                 )
                 tunnel_url = tunnel_info.get("url") or tunnel_info.get("path")
                 safe_id = self._client._safe_id(self._sid)
-                tls = os.environ.get("YR_GATEWAY_TLS", "0").strip().lower() in (
-                    "1",
-                    "true",
-                    "yes",
-                )
+                tls = _gateway_uses_tls(self._connection)
                 ws_scheme = "wss" if tls else "ws"
                 tunnel_ws_url = _compose_gateway_url(
                     gateway=gateway,
@@ -473,7 +498,7 @@ class Sandbox:
             self._files = Filesystem(self._client, self._sid)
             self._commands = Commands(self._client, self._sid, default_cwd=self._cwd)
             self._shells = Shells(self._client, self._sid, default_cwd=self._cwd)
-            self._pty = Pty(self._sid)
+            self._pty = Pty(self._sid, connection=self._connection)
         except Exception:
             if self._tunnel_client is not None:
                 try:
@@ -543,11 +568,7 @@ class Sandbox:
             raise ValueError(
                 f"Port {port} is not in forwarded ports: {self._forwarded_ports}"
             )
-        gateway = os.environ.get("YR_GATEWAY_ADDRESS", "").strip()
-        if not gateway:
-            gateway = os.environ.get("YR_SERVER_ADDRESS", "").strip()
-        if not gateway:
-            raise ValueError("YR_GATEWAY_ADDRESS or YR_SERVER_ADDRESS must be set")
+        gateway = _gateway_address(self._connection)
         safe_id = self._client._safe_id(self._sid)
         return f"http://{gateway}/{safe_id}/{port}"
 
@@ -634,8 +655,18 @@ class Sandbox:
         self._close(delete_remote=True)
 
     @classmethod
-    def delete(cls, sandbox_id: str) -> None:
-        client = SandboxClient()
+    def delete(
+        cls,
+        sandbox_id: str,
+        *,
+        connection: Optional[ConnectionConfig] = None,
+    ) -> None:
+        if connection is not None and not isinstance(connection, ConnectionConfig):
+            raise TypeError("connection must be a ConnectionConfig or None")
+        if connection is None:
+            client = SandboxClient()
+        else:
+            client = SandboxClient(connection=connection)
         try:
             client.delete(sandbox_id)
         finally:

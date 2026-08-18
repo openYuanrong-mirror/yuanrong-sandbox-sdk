@@ -1,9 +1,12 @@
 import inspect
+import os
 import unittest
 from dataclasses import fields
+from unittest.mock import patch
 
 from yr_sandbox import (
     CommandInfo,
+    ConnectionConfig,
     Mount,
     NodeInfo,
     S3Config,
@@ -13,6 +16,37 @@ from yr_sandbox import (
 
 
 class TypesTests(unittest.TestCase):
+    def test_connection_config_is_immutable_and_redacts_token(self):
+        config = ConnectionConfig(
+            server_address=" frontend.example:443/ ",
+            token=" secret-token ",
+            gateway_address=" gateway.example:8080/ ",
+        )
+        self.assertTrue(type(config).__dataclass_params__.frozen)
+        self.assertEqual(config.server_address, "frontend.example:443")
+        self.assertEqual(config.gateway_address, "gateway.example:8080")
+        self.assertEqual(config.token, "secret-token")
+        self.assertNotIn("secret-token", repr(config))
+
+    def test_connection_config_snapshots_environment(self):
+        with patch.dict(
+            os.environ,
+            {
+                "YR_SERVER_ADDRESS": "frontend.example:443",
+                "YR_TOKEN": "secret",
+                "YR_TLS": "0",
+                "YR_GATEWAY_ADDRESS": "gateway.example:8080",
+                "YR_GATEWAY_TLS": "1",
+            },
+            clear=True,
+        ):
+            config = ConnectionConfig.from_env()
+
+        self.assertEqual(config.server_address, "frontend.example:443")
+        self.assertEqual(config.gateway_address, "gateway.example:8080")
+        self.assertFalse(config.use_tls)
+        self.assertTrue(config.gateway_use_tls)
+
     def test_types_are_frozen(self):
         node = NodeInfo(
             id="node-a",
@@ -68,7 +102,9 @@ class TypesTests(unittest.TestCase):
             Mount(target="/mnt/data", image_url="")
 
     def test_resources_uses_process_configuration(self):
-        self.assertEqual(list(inspect.signature(resources).parameters), [])
+        parameters = inspect.signature(resources).parameters
+        self.assertEqual(list(parameters), ["connection"])
+        self.assertIsNone(parameters["connection"].default)
 
 
 if __name__ == "__main__":

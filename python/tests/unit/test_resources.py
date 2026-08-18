@@ -3,12 +3,17 @@ import unittest
 from unittest.mock import patch
 
 import httpx
+from yr_sandbox import ConnectionConfig
 from yr_sandbox._resources import resources
 from yr_sandbox._transport import SandboxClient
 
 
 class _ResourceClient:
     closed = False
+    connection = None
+
+    def __init__(self, *, connection=None):
+        type(self).connection = connection
 
     def resources(self):
         return {
@@ -77,6 +82,42 @@ class ResourceTests(unittest.TestCase):
         self.assertEqual(seen["path"], "/global-scheduler/resources")
         self.assertEqual(seen["type"], "json")
         self.assertIn("resource", payload)
+
+    def test_client_accepts_explicit_connection_without_environment_state(self):
+        connection = ConnectionConfig(
+            server_address="frontend.example:443",
+            token="secret",
+            use_tls=True,
+        )
+        with (
+            patch(
+                "yr_sandbox._transport.acquire_shared_http_client"
+            ) as acquire,
+            patch.dict("os.environ", {}, clear=True),
+        ):
+            client = SandboxClient(connection=connection)
+            client.close()
+
+        acquire.assert_called_once_with(
+            "https",
+            "frontend.example:443",
+            False,
+            "secret",
+        )
+
+    def test_resources_accepts_explicit_connection_config(self):
+        connection = ConnectionConfig(
+            server_address="frontend.example:443",
+            token="secret",
+        )
+        _ResourceClient.connection = None
+        with (
+            patch("yr_sandbox._resources.SandboxClient", _ResourceClient),
+            patch.dict("os.environ", {}, clear=True),
+        ):
+            resources(connection=connection)
+
+        self.assertIs(_ResourceClient.connection, connection)
 
 
 if __name__ == "__main__":

@@ -1,6 +1,7 @@
 from .types import (
     CommandInfo,
     CommandResult,
+    ConnectionConfig,
     EntryInfo,
     Mount,
     NetworkPolicy,
@@ -13,6 +14,7 @@ from .types import (
 SDK_CAPABILITIES = frozenset(
     {
         "local-close",
+        "explicit-connection-config",
         "tunnel-proxy-port",
     }
 )
@@ -27,6 +29,7 @@ __all__ = [
     "PtySession",
     "PtyError",
     # data types
+    "ConnectionConfig",
     "EntryInfo",
     "CommandResult",
     "CommandInfo",
