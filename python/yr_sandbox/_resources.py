@@ -1,9 +1,9 @@
 """Private resource discovery helpers backed by the scheduler query API."""
 
-from typing import Any, Iterable, List, Mapping
+from typing import Any, Iterable, List, Mapping, Optional
 
 from ._transport import SandboxClient
-from .types import NodeInfo
+from .types import ConnectionConfig, NodeInfo
 
 
 def _resource_values(value: object) -> Mapping[str, float]:
@@ -58,14 +58,21 @@ def _coerce_node(node_id: str, item: Mapping[str, object]) -> NodeInfo:
         raise ValueError(f"invalid node item: {item!r}") from exc
 
 
-def resources() -> List[NodeInfo]:
+def resources(
+    *, connection: Optional[ConnectionConfig] = None
+) -> List[NodeInfo]:
     """Return tenant-visible schedulable nodes from sandbox v1.
 
     This function uses ``SandboxClient.resources()`` and decodes the ``items``
     payload into strongly-typed :class:`NodeInfo` objects.
     """
 
-    client = SandboxClient()
+    if connection is not None and not isinstance(connection, ConnectionConfig):
+        raise TypeError("connection must be a ConnectionConfig or None")
+    if connection is None:
+        client = SandboxClient()
+    else:
+        client = SandboxClient(connection=connection)
     try:
         payload = client.resources()
     finally:

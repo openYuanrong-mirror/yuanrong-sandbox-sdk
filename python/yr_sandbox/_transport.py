@@ -6,7 +6,8 @@ Small control-plane requests use the unified sandbox action model::
     DELETE /api/sandbox/v1/sandboxes/{sandboxID}
     POST   /api/sandbox/v1/sandboxes/{sandboxID}/invoke   {"action", "args"}
 
-Environment variables::
+Connection settings may be passed explicitly with ``ConnectionConfig`` or read
+from these environment variables::
 
     YR_SERVER_ADDRESS   host:port of the frontend gateway (required)
     YR_TOKEN            JWT, sent in the ``X-Auth`` header (required)
@@ -30,7 +31,7 @@ import httpx
 
 # Default per-call timeout buffer, mirroring types.YR_GET_TIMEOUT_BUFFER.
 from ._http_pool import acquire_shared_http_client
-from .types import YR_GET_DEFAULT_TIMEOUT, YR_GET_TIMEOUT_BUFFER
+from .types import ConnectionConfig, YR_GET_DEFAULT_TIMEOUT, YR_GET_TIMEOUT_BUFFER
 
 logger = logging.getLogger(__name__)
 
@@ -80,13 +81,6 @@ _DELETE_MAX_ATTEMPTS = 3
 _DELETE_RETRY_BACKOFF_SECONDS = 0.1
 
 
-def _require_env(name: str) -> str:
-    value = os.environ.get(name, "").strip()
-    if not value:
-        raise RuntimeError(f"{name} is not set")
-    return value
-
-
 class SandboxClient:
     """Thin HTTP client over the frontend sandbox v1 control plane.
 
@@ -101,16 +95,27 @@ class SandboxClient:
         token: Optional[str] = None,
         *,
         verify_tls: bool = False,
+        connection: Optional[ConnectionConfig] = None,
     ):
-        self._server = (server or _require_env("YR_SERVER_ADDRESS")).rstrip("/")
-        self._token = token or _require_env("YR_TOKEN")
+        if connection is not None:
+            if not isinstance(connection, ConnectionConfig):
+                raise TypeError("connection must be a ConnectionConfig")
+            if server is not None or token is not None or verify_tls:
+                raise ValueError(
+                    "connection cannot be combined with server, token, or verify_tls"
+                )
+        else:
+            connection = ConnectionConfig.from_env(
+                server_address=server,
+                token=token,
+                verify_tls=verify_tls,
+            )
+        self._connection = connection
+        self._server = connection.server_address
+        self._token = connection.token
         # Production gateways are TLS. Set YR_TLS=0 for a plain-HTTP dev
         # cluster (e.g. an AIO frontend started with frontend_ssl_enable=false).
-        self._tls = os.environ.get("YR_TLS", "1").strip().lower() not in (
-            "0",
-            "false",
-            "no",
-        )
+        self._tls = connection.use_tls
         scheme = "https" if self._tls else "http"
         self._origin = f"{scheme}://{self._server}"
         self._base = f"{scheme}://{self._server}/api/sandbox/v1"
@@ -119,7 +124,7 @@ class SandboxClient:
         self._http = acquire_shared_http_client(
             scheme,
             self._server,
-            verify_tls,
+            connection.verify_tls,
             self._token,
         )
 
@@ -924,6 +929,10 @@ class SandboxClient:
         ``@`` -> ``-at-`` and ``/`` ``.`` ``_`` -> ``-``."""
         s = sandbox_id.replace("@", "-at-")
         return "".join("-" if c in "/._" else c for c in s)
+
+    @property
+    def connection(self) -> ConnectionConfig:
+        return self._connection
 
     @property
     def token(self) -> str:

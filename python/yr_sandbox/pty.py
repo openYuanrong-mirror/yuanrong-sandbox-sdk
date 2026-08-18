@@ -20,6 +20,7 @@ from ._pty_transport import (
     _PtyConnection,
     _PtyTransportError,
 )
+from .types import ConnectionConfig
 
 
 class PtyError(RuntimeError):
@@ -50,7 +51,11 @@ def _normalize_command(command: str | Sequence[str]) -> list[str]:
     return arguments
 
 
-def _use_tls() -> bool:
+def _use_tls(connection: ConnectionConfig | None = None) -> bool:
+    if connection is not None:
+        if connection.gateway_address is not None:
+            return connection.gateway_use_tls
+        return connection.use_tls
     gateway = os.environ.get("YR_GATEWAY_ADDRESS", "").strip()
     if gateway:
         raw = os.environ.get("YR_GATEWAY_TLS", "0")
@@ -140,8 +145,16 @@ class PtySession:
 class Pty:
     """Factory for interactive PTY sessions in one sandbox."""
 
-    def __init__(self, instance_id: str) -> None:
+    def __init__(
+        self,
+        instance_id: str,
+        *,
+        connection: ConnectionConfig | None = None,
+    ) -> None:
+        if connection is not None and not isinstance(connection, ConnectionConfig):
+            raise TypeError("connection must be a ConnectionConfig or None")
         self._instance_id = instance_id
+        self._connection_config = connection
         self._sessions: set[PtySession] = set()
         self._lock = threading.Lock()
 
@@ -164,15 +177,24 @@ class Pty:
         if timeout <= 0:
             raise ValueError("timeout must be greater than zero")
 
-        token = os.environ.get("YR_TOKEN", "").strip()
-        if not token:
-            raise RuntimeError("YR_TOKEN is not set")
-        server = os.environ.get("YR_GATEWAY_ADDRESS", "").strip()
-        if not server:
-            server = os.environ.get("YR_SERVER_ADDRESS", "").strip()
-        if not server:
-            raise RuntimeError("YR_GATEWAY_ADDRESS or YR_SERVER_ADDRESS is not set")
-        use_tls = _use_tls()
+        if self._connection_config is not None:
+            token = self._connection_config.token
+            server = (
+                self._connection_config.gateway_address
+                or self._connection_config.server_address
+            )
+        else:
+            token = os.environ.get("YR_TOKEN", "").strip()
+            if not token:
+                raise RuntimeError("YR_TOKEN is not set")
+            server = os.environ.get("YR_GATEWAY_ADDRESS", "").strip()
+            if not server:
+                server = os.environ.get("YR_SERVER_ADDRESS", "").strip()
+            if not server:
+                raise RuntimeError(
+                    "YR_GATEWAY_ADDRESS or YR_SERVER_ADDRESS is not set"
+                )
+        use_tls = _use_tls(self._connection_config)
         uri = _build_pty_uri(
             server=server,
             use_tls=use_tls,
@@ -189,7 +211,7 @@ class Pty:
             if session_ref:
                 self._remove(session_ref[0])
 
-        connection = _PtyConnection(
+        transport = _PtyConnection(
             uri,
             ssl_context=_ssl_context(use_tls),
             rows=rows,
@@ -197,14 +219,14 @@ class Pty:
             on_data=on_data,
             on_done=on_done,
         )
-        session = PtySession(connection, remove=self._remove)
+        session = PtySession(transport, remove=self._remove)
         session_ref.append(session)
         with self._lock:
             self._sessions.add(session)
         try:
-            connection.start(float(timeout))
+            transport.start(float(timeout))
         except (TimeoutError, _PtyTransportError) as exc:
-            connection.close()
+            transport.close()
             self._remove(session)
             if isinstance(exc, TimeoutError):
                 raise

@@ -8,6 +8,7 @@
     "Pty",
     "PtySession",
     "PtyError",
+    "ConnectionConfig",
     "EntryInfo",
     "CommandResult",
     "CommandInfo",

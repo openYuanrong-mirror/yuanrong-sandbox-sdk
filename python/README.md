@@ -95,6 +95,32 @@ enables it.
 
 ## Configuration
 
+Connection settings can be passed explicitly and reused by every transport
+owned by a sandbox:
+
+```python
+from yr_sandbox import ConnectionConfig, Sandbox, resources
+
+connection = ConnectionConfig(
+    server_address="frontend.example.com:443",
+    token="<token>",
+    use_tls=True,
+    gateway_address="gateway.example.com:443",
+    gateway_use_tls=True,
+)
+
+with Sandbox(image="python:3.12-slim", connection=connection) as sandbox:
+    print(sandbox.id)
+
+nodes = resources(connection=connection)
+Sandbox.delete("sandbox-id", connection=connection)
+```
+
+`ConnectionConfig` is immutable and hides its token from `repr`. When it is
+provided, lifecycle HTTP, reverse tunnel URLs, user port URLs, and PTY sessions
+use the object rather than reading the five connection-related `YR_*`
+variables. If it is omitted, the SDK keeps the existing environment fallback:
+
 | Var | Meaning |
 | --- | --- |
 | `YR_SERVER_ADDRESS` | Frontend gateway `host:port` for lifecycle, invoke, direct file IO. Required. |

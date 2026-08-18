@@ -2,6 +2,7 @@ import unittest
 from unittest.mock import patch
 from urllib.parse import parse_qs, urlparse
 
+from yr_sandbox import ConnectionConfig
 from yr_sandbox._pty_transport import _build_pty_uri
 from yr_sandbox.pty import Pty, _use_tls
 
@@ -35,6 +36,36 @@ class PtyTests(unittest.TestCase):
             clear=True,
         ):
             self.assertFalse(_use_tls())
+
+    def test_pty_uses_explicit_connection_without_environment_state(self):
+        seen = {}
+
+        class Connection:
+            def __init__(self, uri, **_kwargs):
+                seen["uri"] = uri
+
+            def start(self, _timeout):
+                pass
+
+            def close(self):
+                pass
+
+        config = ConnectionConfig(
+            server_address="frontend.example:443",
+            token="secret",
+            gateway_address="gateway.example:8443",
+            gateway_use_tls=True,
+        )
+        with (
+            patch("yr_sandbox.pty._PtyConnection", Connection),
+            patch.dict("os.environ", {}, clear=True),
+        ):
+            Pty("sandbox-1", connection=config).create("echo ok")
+
+        parsed = urlparse(seen["uri"])
+        self.assertEqual(parsed.scheme, "wss")
+        self.assertEqual(parsed.netloc, "gateway.example:8443")
+        self.assertEqual(parse_qs(parsed.query)["token"], ["secret"])
 
 
 if __name__ == "__main__":
