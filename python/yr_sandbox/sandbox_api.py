@@ -199,6 +199,7 @@ class Sandbox:
         *,
         xpu: Optional[str] = None,
         storage_mb: Optional[int] = None,
+        storage_limit_mb: int = 0,
         network: Optional[NetworkPolicy] = None,
         create_timeout: Optional[int] = None,
         connection: Optional[ConnectionConfig] = None,
@@ -237,6 +238,9 @@ class Sandbox:
                 version supports one ``gpu`` request.
             storage_mb: Temporary writable root filesystem capacity in MiB.
                 ``None`` uses the cluster default.
+            storage_limit_mb: Writable root filesystem hard limit in MiB. ``0``
+                uses *storage_mb* (or the cluster default when *storage_mb* is
+                omitted).
             network: Optional creation-time network policy. Omitting it allows
                 unrestricted network access.
             connection: Explicit frontend and gateway connection settings.
@@ -281,6 +285,16 @@ class Sandbox:
                 raise TypeError("storage_mb must be an integer or None")
             if storage_mb <= 0:
                 raise ValueError("storage_mb must be greater than 0")
+        if isinstance(storage_limit_mb, bool) or not isinstance(
+            storage_limit_mb, int
+        ):
+            raise TypeError("storage_limit_mb must be an integer")
+        if storage_limit_mb < 0:
+            raise ValueError("storage_limit_mb must be 0 or greater")
+        if storage_mb is not None and 0 < storage_limit_mb < storage_mb:
+            raise ValueError(
+                "storage_limit_mb must be greater than or equal to storage_mb"
+            )
         if network is not None and not isinstance(network, NetworkPolicy):
             raise TypeError("network must be a NetworkPolicy or None")
         if connection is not None and not isinstance(connection, ConnectionConfig):
@@ -380,6 +394,7 @@ class Sandbox:
             body["xpu"] = xpu
         if storage_mb is not None:
             body["storageMb"] = storage_mb
+        body["storage_limit_mb"] = storage_limit_mb
         if env:
             body["env"] = dict(env)
         if node_id:
