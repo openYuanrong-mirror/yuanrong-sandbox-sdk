@@ -81,7 +81,8 @@ Base path: `/api/sandbox/v1/sandboxes` on `YR_SERVER_ADDRESS`.
 `CreateV1Request` fields used by SDKs include `name`, `namespace`, `tenant`,
 `runtime`, `image`/`rootfs`, `ports`, `idleTimeoutSeconds`,
 `createTimeoutSeconds`, `scheduleTimeoutSeconds`, `cpu`, `memory`,
-`cpu_limit`, `mem_limit`, `env`, `mounts`, `extra_config`, and `tunnel`.
+`cpu_limit`, `mem_limit`, `storage_limit`, `env`, `mounts`, `extra_config`, and
+`tunnel`.
 Frontend owns internal RRT port environment injection (`RRT_HTTP_PORT`,
 `RRT_TUNNEL_WS_PORT`, `RRT_TUNNEL_HTTP_PORT`); SDK callers should request
 features declaratively instead of setting those ports.
