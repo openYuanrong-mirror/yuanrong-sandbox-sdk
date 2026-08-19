@@ -32,13 +32,13 @@ Request temporary writable storage:
 ```python
 from yr_sandbox import Sandbox
 
-Sandbox(storage_mb=153600, storage_limit=204800)
+Sandbox(storage_mb=153600, storage_limit_mb=204800)
 ```
 
 `storage_mb` is expressed in MiB. Frontend converts it to bytes in the
-FunctionSystem custom resource named `storage`. `storage_limit` is also in MiB
-and sets the writable root filesystem hard limit; `0` uses `storage_mb` or the
-cluster default when `storage_mb` is omitted.
+FunctionSystem custom resource named `storage`. `storage_limit_mb` is also in
+MiB and sets the writable root filesystem hard limit; `0` uses `storage_mb` or
+the cluster default when `storage_mb` is omitted.
 
 Normally, configure only one sandbox create budget; the other value is derived
 automatically with a 30-second startup buffer:

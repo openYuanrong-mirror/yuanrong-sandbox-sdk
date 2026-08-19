@@ -305,13 +305,13 @@ class SDKContractTests(unittest.TestCase):
             Sandbox(
                 image="ubuntu:22.04",
                 storage_mb=153600,
-                storage_limit=204800,
+                storage_limit_mb=204800,
                 detached=True,
             )
 
         body = _FakeClient.created[-1]
         self.assertEqual(body["storageMb"], 153600)
-        self.assertEqual(body["storage_limit"], 204800)
+        self.assertEqual(body["storage_limit_mb"], 204800)
 
     def test_storage_default_is_omitted(self):
         with patch("yr_sandbox.sandbox_api.SandboxClient", _FakeClient):
@@ -319,10 +319,10 @@ class SDKContractTests(unittest.TestCase):
 
         body = _FakeClient.created[-1]
         self.assertNotIn("storageMb", body)
-        self.assertEqual(body["storage_limit"], 0)
+        self.assertEqual(body["storage_limit_mb"], 0)
         signature = inspect.signature(Sandbox).parameters
         self.assertIsNone(signature["storage_mb"].default)
-        self.assertEqual(signature["storage_limit"].default, 0)
+        self.assertEqual(signature["storage_limit_mb"].default, 0)
 
     def test_invalid_storage_is_rejected_before_create(self):
         invalid_cases = [
@@ -338,22 +338,25 @@ class SDKContractTests(unittest.TestCase):
                         Sandbox(image="ubuntu:22.04", storage_mb=storage_mb)
         self.assertEqual(_FakeClient.created, [])
 
-    def test_invalid_storage_limit_is_rejected_before_create(self):
+    def test_invalid_storage_limit_mb_is_rejected_before_create(self):
         invalid_cases = [
             (True, TypeError),
             ("1024", TypeError),
             (-1, ValueError),
         ]
         with patch("yr_sandbox.sandbox_api.SandboxClient", _FakeClient):
-            for storage_limit, error_type in invalid_cases:
-                with self.subTest(storage_limit=storage_limit):
+            for storage_limit_mb, error_type in invalid_cases:
+                with self.subTest(storage_limit_mb=storage_limit_mb):
                     with self.assertRaises(error_type):
-                        Sandbox(image="ubuntu:22.04", storage_limit=storage_limit)
+                        Sandbox(
+                            image="ubuntu:22.04",
+                            storage_limit_mb=storage_limit_mb,
+                        )
             with self.assertRaisesRegex(ValueError, "greater than or equal"):
                 Sandbox(
                     image="ubuntu:22.04",
                     storage_mb=2048,
-                    storage_limit=1024,
+                    storage_limit_mb=1024,
                 )
         self.assertEqual(_FakeClient.created, [])
 
