@@ -11,7 +11,8 @@ from these environment variables::
 
     YR_SERVER_ADDRESS   host:port of the frontend gateway (required)
     YR_TOKEN            JWT, sent in the ``X-Auth`` header (required)
-    YR_GATEWAY_ADDRESS  optional sandbox gateway for tunnel/user port URLs
+    YR_GATEWAY_ADDRESS  optional frontend gateway for reverse tunnel URLs
+    YR_SANDBOX_ROUTER_ADDRESS  optional direct router for user port URLs
 
 Response format:
 - Auth uses the raw JWT in the ``X-Auth`` header (no ``Bearer`` prefix).
@@ -79,6 +80,8 @@ _CREATE_RETRYABLE_ERRORS = (
 _RETRYABLE_GATEWAY_STATUS_CODES = frozenset((502, 503, 504))
 _DELETE_MAX_ATTEMPTS = 3
 _DELETE_RETRY_BACKOFF_SECONDS = 0.1
+_LIFECYCLE_MAX_ATTEMPTS = 3
+_LIFECYCLE_RETRY_BACKOFF_SECONDS = 0.1
 
 
 class SandboxClient:
@@ -131,7 +134,7 @@ class SandboxClient:
         # ── HTTP-direct-via-frontend /direct route ──────────────────────────
         # RRT direct invoke is a control-plane fast path, so it follows the
         # normal frontend gateway (YR_SERVER_ADDRESS / YR_TLS) rather than the
-        # data-plane gateway used by tunnel and user port URLs.  The frontend
+        # data-plane addresses used by tunnel and user port URLs. The frontend
         # exposes /direct and forwards it to sandboxRouter after frontend JWT
         # auth. The frontend owns the RRT control-port mapping, so clients do
         # not expose the internal RRT port in the URL:
@@ -365,6 +368,154 @@ class SandboxClient:
 
         raise SandboxError(
             f"delete {sandbox_id} failed after {_DELETE_MAX_ATTEMPTS} attempts "
+            f"(requestId={request_id}): {last_error}"
+        ) from last_error
+
+    def create_snapshot(
+        self,
+        sandbox_id: str,
+        *,
+        name: Optional[str] = None,
+    ) -> Dict[str, Any]:
+        """Create a reusable Snapshot with one explicit request attempt.
+
+        A broken connection or gateway error is an uncertain outcome: the
+        server may already have committed the immutable Snapshot. Do not hide
+        that state behind an SDK sleep/retry loop. The request ID in the error
+        lets an explicit reconciliation flow replay the same logical action.
+        """
+        request_id = self._new_request_id("snapshot")
+        body = {"name": name} if name is not None else {}
+        try:
+            resp = self._http.post(
+                f"{self._base}/sandboxes/{sandbox_id}/snapshots",
+                json=body,
+                headers={"X-YR-Request-ID": request_id},
+                timeout=YR_GET_DEFAULT_TIMEOUT + YR_GET_TIMEOUT_BUFFER,
+            )
+        except _CREATE_RETRYABLE_ERRORS as exc:
+            raise SandboxError(
+                "sandbox snapshot result is uncertain "
+                f"(requestId={request_id}): {exc}"
+            ) from exc
+        if resp.status_code in _RETRYABLE_GATEWAY_STATUS_CODES:
+            raise SandboxError(
+                "sandbox snapshot result is uncertain "
+                f"(requestId={request_id}): HTTP {resp.status_code}: {resp.text}"
+            )
+        return self._json(resp)
+
+    def get_snapshot(self, snapshot_id: str) -> Dict[str, Any]:
+        resp = self._http.get(
+            f"{self._base}/snapshots/{snapshot_id}",
+            timeout=YR_GET_DEFAULT_TIMEOUT + YR_GET_TIMEOUT_BUFFER,
+        )
+        return self._json(resp)
+
+    def list_snapshots(
+        self,
+        *,
+        name: Optional[str] = None,
+        page_token: Optional[str] = None,
+        page_size: Optional[int] = None,
+    ) -> Dict[str, Any]:
+        params: Dict[str, Any] = {}
+        if name is not None:
+            params["name"] = name
+        if page_token is not None:
+            params["pageToken"] = page_token
+        if page_size is not None:
+            params["pageSize"] = page_size
+        resp = self._http.get(
+            f"{self._base}/snapshots",
+            params=params,
+            timeout=YR_GET_DEFAULT_TIMEOUT + YR_GET_TIMEOUT_BUFFER,
+        )
+        return self._json(resp)
+
+    def delete_snapshot(self, snapshot_id: str) -> None:
+        request_id = self._new_request_id("delete-snapshot")
+        resp = self._http.delete(
+            f"{self._base}/snapshots/{snapshot_id}",
+            headers={"X-YR-Request-ID": request_id},
+            timeout=YR_GET_DEFAULT_TIMEOUT + YR_GET_TIMEOUT_BUFFER,
+        )
+        self._json(resp)
+
+    def pause(
+        self,
+        sandbox_id: str,
+        ttl_seconds: int = 90_000,
+    ) -> Dict[str, Any]:
+        """Synchronously pause one sandbox using one internal request identity."""
+        return self._lifecycle_request(
+            sandbox_id,
+            operation="pause",
+            body={"ttlSeconds": ttl_seconds},
+        )
+
+    def resume(self, sandbox_id: str) -> Dict[str, Any]:
+        """Synchronously resume one sandbox using one internal request identity."""
+        return self._lifecycle_request(
+            sandbox_id,
+            operation="resume",
+            body={},
+        )
+
+    def _lifecycle_request(
+        self,
+        sandbox_id: str,
+        *,
+        operation: str,
+        body: Dict[str, Any],
+    ) -> Dict[str, Any]:
+        request_id = self._new_request_id(operation)
+        last_error: Optional[BaseException] = None
+        for attempt in range(1, _LIFECYCLE_MAX_ATTEMPTS + 1):
+            try:
+                resp = self._http.post(
+                    f"{self._base}/sandboxes/{sandbox_id}/{operation}",
+                    json=body,
+                    headers={"X-YR-Request-ID": request_id},
+                    timeout=YR_GET_DEFAULT_TIMEOUT + YR_GET_TIMEOUT_BUFFER,
+                )
+            except _CREATE_RETRYABLE_ERRORS as exc:
+                last_error = exc
+            else:
+                if resp.status_code not in _RETRYABLE_GATEWAY_STATUS_CODES:
+                    try:
+                        result = self._json(resp)
+                    except SandboxError as exc:
+                        raise SandboxError(
+                            f"sandbox {operation} failed "
+                            f"(requestId={request_id}): {exc}"
+                        ) from exc
+                    if operation == "pause" and result.get("snapshotId") != request_id:
+                        raise SandboxError(
+                            "sandbox pause returned a snapshotId that does not match "
+                            f"the internal requestId={request_id}"
+                        )
+                    return result
+                last_error = _RetryableHTTPStatus(
+                    f"HTTP {resp.status_code}: {resp.text}"
+                )
+
+            if attempt >= _LIFECYCLE_MAX_ATTEMPTS:
+                break
+            logger.warning(
+                "sandbox %s transport error; retrying "
+                "request_id=%s sandbox_id=%s attempt=%d/%d error=%s",
+                operation,
+                request_id,
+                sandbox_id,
+                attempt,
+                _LIFECYCLE_MAX_ATTEMPTS,
+                last_error,
+            )
+            time.sleep(_LIFECYCLE_RETRY_BACKOFF_SECONDS * (2 ** (attempt - 1)))
+
+        raise SandboxError(
+            f"sandbox {operation} failed after {_LIFECYCLE_MAX_ATTEMPTS} attempts "
             f"(requestId={request_id}): {last_error}"
         ) from last_error
 

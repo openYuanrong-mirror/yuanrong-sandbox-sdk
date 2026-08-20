@@ -3,6 +3,7 @@ import inspect
 import unittest
 from unittest.mock import patch
 
+import yr_sandbox
 from yr_sandbox import (
     ConnectionConfig,
     PortForwarding,
@@ -72,6 +73,34 @@ class _FakeClient:
 class SDKContractTests(unittest.TestCase):
     def setUp(self):
         _FakeClient.created.clear()
+
+    def test_pause_resume_results_are_public_frozen_value_types(self):
+        pause_result_type = getattr(yr_sandbox, "PauseResult", None)
+        resume_result_type = getattr(yr_sandbox, "ResumeResult", None)
+        sandbox_error_type = getattr(yr_sandbox, "SandboxError", None)
+        self.assertIsNotNone(pause_result_type, "PauseResult must be public")
+        self.assertIsNotNone(resume_result_type, "ResumeResult must be public")
+        self.assertIsNotNone(sandbox_error_type, "SandboxError must be public")
+        pause = pause_result_type(
+            sandbox_id="sandbox-1",
+            snapshot_id="pause-1",
+            size=17,
+            state="paused",
+            expires_at=1_800_000_000,
+        )
+        resume = resume_result_type(
+            sandbox_id="sandbox-1",
+            state="running",
+            route_address="10.0.0.8:9000",
+            function_proxy_id="proxy-a",
+            node_id="node-a",
+            port_mappings={"8080": 41080},
+        )
+
+        with self.assertRaisesRegex(Exception, "cannot assign"):
+            pause.state = "running"
+        with self.assertRaisesRegex(Exception, "cannot assign"):
+            resume.state = "paused"
 
     def test_sandbox_runtime_and_default_cwd_are_applied_without_frontend_cwd_field(self):
         with patch("yr_sandbox.sandbox_api.SandboxClient", _FakeClient):

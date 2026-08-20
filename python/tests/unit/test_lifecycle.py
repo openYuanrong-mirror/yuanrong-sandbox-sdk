@@ -3,6 +3,7 @@ import os
 import unittest
 from unittest.mock import patch
 
+import yr_sandbox
 from yr_sandbox import ConnectionConfig, Sandbox
 
 
@@ -31,6 +32,165 @@ class _PTY:
 
 
 class LifecycleTests(unittest.TestCase):
+    def test_get_port_url_prefers_independent_sandbox_router(self):
+        sandbox = object.__new__(Sandbox)
+        sandbox._sid = "default-sandbox-1"
+        sandbox._forwarded_ports = {8080}
+
+        class Client:
+            @staticmethod
+            def _safe_id(sandbox_id):
+                return sandbox_id
+
+        sandbox._client = Client()
+        with patch.dict(
+            os.environ,
+            {
+                "YR_SERVER_ADDRESS": "frontend-control:8888",
+                "YR_TLS": "1",
+                "YR_GATEWAY_ADDRESS": "frontend-gateway:9443",
+                "YR_GATEWAY_TLS": "1",
+                "YR_SANDBOX_ROUTER_ADDRESS": "sandbox-router:8080",
+            },
+            clear=True,
+        ):
+            self.assertEqual(
+                sandbox.get_port_url(8080),
+                "http://sandbox-router:8080/default-sandbox-1/8080",
+            )
+
+    def test_get_port_url_uses_gateway_tls_without_changing_pty_routing(self):
+        sandbox = object.__new__(Sandbox)
+        sandbox._sid = "default-sandbox-1"
+        sandbox._forwarded_ports = {8080}
+
+        class Client:
+            @staticmethod
+            def _safe_id(sandbox_id):
+                return sandbox_id
+
+        sandbox._client = Client()
+        with patch.dict(
+            os.environ,
+            {
+                "YR_SERVER_ADDRESS": "frontend-control:8888",
+                "YR_TLS": "1",
+                "YR_GATEWAY_ADDRESS": "sandbox-router:9443",
+                "YR_GATEWAY_TLS": "1",
+            },
+            clear=True,
+        ):
+            self.assertEqual(
+                sandbox.get_port_url(8080),
+                "https://sandbox-router:9443/default-sandbox-1/8080",
+            )
+
+    def test_get_port_url_falls_back_to_control_plane_tls_setting(self):
+        sandbox = object.__new__(Sandbox)
+        sandbox._sid = "default-sandbox-1"
+        sandbox._forwarded_ports = {8080}
+
+        class Client:
+            @staticmethod
+            def _safe_id(sandbox_id):
+                return sandbox_id
+
+        sandbox._client = Client()
+        with patch.dict(
+            os.environ,
+            {"YR_SERVER_ADDRESS": "frontend:8888", "YR_TLS": "1"},
+            clear=True,
+        ):
+            self.assertEqual(
+                sandbox.get_port_url(8080),
+                "https://frontend:8888/default-sandbox-1/8080",
+            )
+
+    def test_pause_and_resume_are_synchronous_without_public_request_id(self):
+        pause = getattr(Sandbox, "pause", None)
+        resume = getattr(Sandbox, "resume", None)
+        self.assertTrue(callable(pause), "Sandbox.pause must exist")
+        self.assertTrue(callable(resume), "Sandbox.resume must exist")
+        self.assertEqual(
+            list(inspect.signature(pause).parameters),
+            ["self", "ttl_seconds"],
+        )
+        self.assertEqual(
+            list(inspect.signature(resume).parameters),
+            ["self"],
+        )
+
+    def test_pause_and_resume_return_typed_authoritative_results(self):
+        pause_result_type = getattr(yr_sandbox, "PauseResult", None)
+        resume_result_type = getattr(yr_sandbox, "ResumeResult", None)
+        self.assertIsNotNone(pause_result_type, "PauseResult must be public")
+        self.assertIsNotNone(resume_result_type, "ResumeResult must be public")
+
+        class Client(_CloseTracker):
+            def pause(self, sandbox_id, ttl_seconds):
+                self.pause_args = (sandbox_id, ttl_seconds)
+                return {
+                    "sandboxId": sandbox_id,
+                    "snapshotId": "pause-123",
+                    "size": 8192,
+                    "state": "paused",
+                    "expiresAt": 1_800_000_000,
+                }
+
+            def resume(self, sandbox_id):
+                self.resume_arg = sandbox_id
+                return {
+                    "sandboxId": sandbox_id,
+                    "state": "running",
+                    "routeAddress": "10.0.0.8:9000",
+                    "functionProxyId": "proxy-a",
+                    "nodeId": "node-a",
+                    "portMappings": {"8080": 41080},
+                }
+
+        sandbox = object.__new__(Sandbox)
+        sandbox._client = Client()
+        sandbox._sid = "default-sandbox-1"
+        sandbox._closed = False
+
+        pause_result = sandbox.pause()
+        resume_result = sandbox.resume()
+
+        self.assertEqual(
+            pause_result,
+            pause_result_type(
+                sandbox_id="default-sandbox-1",
+                snapshot_id="pause-123",
+                size=8192,
+                state="paused",
+                expires_at=1_800_000_000,
+            ),
+        )
+        self.assertEqual(sandbox._client.pause_args, ("default-sandbox-1", 90_000))
+        self.assertEqual(
+            resume_result,
+            resume_result_type(
+                sandbox_id="default-sandbox-1",
+                state="running",
+                route_address="10.0.0.8:9000",
+                function_proxy_id="proxy-a",
+                node_id="node-a",
+                port_mappings={"8080": 41080},
+            ),
+        )
+        self.assertEqual(sandbox._client.resume_arg, "default-sandbox-1")
+
+    def test_pause_rejects_invalid_ttl_before_transport(self):
+        sandbox = object.__new__(Sandbox)
+        sandbox._client = _CloseTracker()
+        sandbox._sid = "default-sandbox-1"
+        sandbox._closed = False
+
+        for value in (True, 0, -1):
+            with self.subTest(value=value):
+                with self.assertRaisesRegex(ValueError, "ttl_seconds"):
+                    sandbox.pause(value)
+
     def test_delete_uses_sandbox_id_without_name_namespace_variant(self):
         self.assertEqual(
             list(inspect.signature(Sandbox.delete).parameters),
