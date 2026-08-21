@@ -78,8 +78,25 @@ class HelloFrameTests(unittest.TestCase):
                 "stream_window_frames": 16,
                 "max_body_size": 536870912,
                 "max_ws_message_size": 8388608,
+                "resume": True,
             },
         )
+
+    def test_offset_round_trips_without_reducing_payload_limit(self):
+        envelope = BinaryEnvelope(
+            request_id=REQUEST_ID,
+            kind=BinaryKind.HTTP_RESPONSE_DATA,
+            payload=b"chunk",
+            offset=123,
+        )
+        self.assertEqual(
+            BinaryEnvelope.decode(envelope.encode(max_payload=5)), envelope
+        )
+
+    def test_resumable_client_hello_carries_stable_session(self):
+        frame = hello_frame(session_id=REQUEST_ID)
+        self.assertTrue(frame["resume"])
+        self.assertEqual(frame["session_id"], REQUEST_ID)
 
     def test_hello_can_explicitly_advertise_v1_for_rollout_fallback(self):
         self.assertEqual(hello_frame(protocol_version=1)["protocol_version"], 1)
