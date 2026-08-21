@@ -6,6 +6,7 @@ can assert direct-vs-fallback routing, response parsing, and the sticky
 disable. Run: ``python tests/test_transport_direct.py`` (or via pytest).
 """
 
+import ast
 import base64
 import hashlib
 import importlib.util
@@ -15,6 +16,7 @@ import json
 import os
 import tarfile
 import tempfile
+import textwrap
 import urllib.request
 import uuid
 from pathlib import Path
@@ -1455,11 +1457,25 @@ def test_tunnel_large_response_example_local_server_serves_owned_ephemeral_port(
 def test_tunnel_client_ignores_proxy_env_for_local_upstream():
     import yr_sandbox.tunnel_client as tunnel_client
 
-    source = inspect.getsource(tunnel_client.TunnelClient._proxy_loop)
-    _check(
-        "trust_env=False" in source,
-        "TunnelClient upstream HTTP client must ignore HTTP_PROXY/NO_PROXY env",
-    )
+    source = textwrap.dedent(inspect.getsource(tunnel_client.TunnelClient))
+    tree = ast.parse(source)
+    clients = [
+        node
+        for node in ast.walk(tree)
+        if isinstance(node, ast.Call)
+        and isinstance(node.func, ast.Attribute)
+        and node.func.attr == "AsyncClient"
+    ]
+    _check(clients, "TunnelClient must construct an upstream HTTP client")
+    for client in clients:
+        trust_env = next(
+            (keyword.value for keyword in client.keywords if keyword.arg == "trust_env"),
+            None,
+        )
+        _check(
+            isinstance(trust_env, ast.Constant) and trust_env.value is False,
+            "TunnelClient upstream HTTP clients must ignore proxy env",
+        )
     print("ok: TunnelClient ignores proxy env for local upstream")
 
 
