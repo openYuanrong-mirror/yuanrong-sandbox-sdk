@@ -968,6 +968,7 @@ class TunnelClientTlsTests(unittest.IsolatedAsyncioTestCase):
         http_client_close_count = 0
         ssl_contexts = []
         http_verify_values = []
+        http_trust_env_values = []
 
         class _EmptyWebSocket:
             async def send(self, _message):
@@ -1000,6 +1001,7 @@ class TunnelClientTlsTests(unittest.IsolatedAsyncioTestCase):
                 nonlocal http_client_count
                 http_client_count += 1
                 http_verify_values.append(kwargs["verify"])
+                http_trust_env_values.append(kwargs["trust_env"])
 
             async def __aenter__(self):
                 return self
@@ -1050,6 +1052,8 @@ class TunnelClientTlsTests(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(
             all(context is expected_http_context for context in http_verify_values)
         )
+        self.assertTrue(http_trust_env_values)
+        self.assertTrue(all(value is False for value in http_trust_env_values))
         self.assertFalse(client._connected.is_set())
 
     def test_wss_uses_explicit_ca_bundle(self):
