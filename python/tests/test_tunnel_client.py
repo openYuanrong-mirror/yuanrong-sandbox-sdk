@@ -194,6 +194,7 @@ class TunnelClientRequestTests(unittest.IsolatedAsyncioTestCase):
                 request_id=request_id,
                 kind=BinaryKind.HTTP_REQUEST_DATA,
                 payload=payload[:65536],
+                offset=0,
             ).encode()
         )
         websocket._incoming.put_nowait(
@@ -201,6 +202,7 @@ class TunnelClientRequestTests(unittest.IsolatedAsyncioTestCase):
                 request_id=request_id,
                 kind=BinaryKind.HTTP_REQUEST_DATA,
                 payload=payload[65536:],
+                offset=65536,
             ).encode()
         )
         websocket.feed({"type": "http_req_end", "id": request_id})
@@ -212,7 +214,12 @@ class TunnelClientRequestTests(unittest.IsolatedAsyncioTestCase):
         initial_window = await asyncio.wait_for(websocket.sent.get(), timeout=2)
         self.assertEqual(
             initial_window,
-            {"type": "window", "id": request_id, "credits": 16},
+            {
+                "type": "window",
+                "id": request_id,
+                "credits": 16,
+                "ack_offset": 0,
+            },
         )
         returned_credits = 0
         while True:
@@ -224,12 +231,20 @@ class TunnelClientRequestTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(returned_credits, 2)
         self.assertEqual(response_begin["type"], "http_resp_begin")
         self.assertEqual(response_begin["status"], 200)
-        websocket.feed({"type": "window", "id": request_id, "credits": 16})
+        websocket.feed(
+            {
+                "type": "window",
+                "id": request_id,
+                "credits": 16,
+                "ack_offset": 0,
+            }
+        )
         response_data = await asyncio.wait_for(websocket.sent.get(), timeout=2)
         self.assertIsInstance(response_data, bytes)
         response_envelope = BinaryEnvelope.decode(response_data)
         self.assertEqual(response_envelope.kind, BinaryKind.HTTP_RESPONSE_DATA)
         self.assertEqual(response_envelope.payload, b"ok")
+        self.assertEqual(response_envelope.offset, 0)
         response_end = await asyncio.wait_for(websocket.sent.get(), timeout=2)
         self.assertEqual(response_end, {"type": "http_resp_end", "id": request_id})
 
@@ -550,6 +565,60 @@ class TunnelClientRequestTests(unittest.IsolatedAsyncioTestCase):
         websocket.close_input()
         await asyncio.wait_for(proxy_task, timeout=2)
 
+    async def test_v2_reconnect_keeps_one_upstream_request_for_stable_id(self):
+        request_id = "00112233-4455-6677-8899-aabbccddeeff"
+        client = TunnelClient(upstream=f"127.0.0.1:{self.server.server_port}")
+        client._http_client = tunnel_client.httpx.AsyncClient(
+            timeout=tunnel_client._http_timeout_for_tunnel(),
+            trust_env=False,
+        )
+
+        first = _FrameWebSocket()
+        first.feed(hello_frame())
+        first.feed(
+            {
+                "type": "http_req",
+                "id": request_id,
+                "method": "GET",
+                "path": "/block",
+                "headers": [],
+                "body": "",
+            }
+        )
+        first_task = asyncio.create_task(client._proxy_loop(first))
+        self.assertTrue(
+            await asyncio.to_thread(_RecordingHandler.block_started.wait, 2)
+        )
+        first.close_input()
+        await asyncio.wait_for(first_task, timeout=2)
+        client._resume_state["ws_ready"].clear()
+
+        second = _FrameWebSocket()
+        second.feed(hello_frame())
+        second.feed(
+            {
+                "type": "http_req",
+                "id": request_id,
+                "method": "GET",
+                "path": "/block",
+                "headers": [],
+                "body": "",
+            }
+        )
+        client._ws = second
+        client._resume_state["ws_ready"].set()
+        second_task = asyncio.create_task(client._proxy_loop(second))
+        _RecordingHandler.block_release.set()
+        response = await asyncio.wait_for(second.sent.get(), timeout=2)
+        self.assertEqual(response["type"], "http_resp")
+        self.assertEqual(response["id"], request_id)
+        self.assertEqual(len(_RecordingHandler.requests), 1)
+
+        client._stopping.set()
+        second.close_input()
+        await asyncio.wait_for(second_task, timeout=2)
+        await client._close_shared_http_client()
+
     async def test_response_keeps_raw_gzip_and_duplicate_set_cookie(self):
         websocket = _FrameWebSocket()
         websocket.feed(
@@ -698,6 +767,29 @@ class TunnelClientHeartbeatTests(unittest.IsolatedAsyncioTestCase):
 
 
 class TunnelClientConfigurationTests(unittest.TestCase):
+    @staticmethod
+    def _capture_http_timeout():
+        captured = []
+
+        class RecordingAsyncClient:
+            def __init__(self, **kwargs):
+                captured.append(kwargs["timeout"])
+
+            async def aclose(self):
+                return None
+
+        with mock.patch.object(
+            tunnel_client.httpx,
+            "AsyncClient",
+            RecordingAsyncClient,
+        ):
+            client = TunnelClient(upstream="127.0.0.1:1")
+            client.start("ws://127.0.0.1:1", timeout=0.05)
+            client.stop()
+        if not captured:
+            raise AssertionError("TunnelClient did not construct its HTTP client")
+        return captured[0]
+
     def test_tunnel_limits_are_capped_and_internally_consistent(self):
         with mock.patch.dict(
             os.environ,
@@ -721,12 +813,16 @@ class TunnelClientConfigurationTests(unittest.TestCase):
         self.assertEqual(client._stream_window_frames, 1024)
         self.assertEqual(client._fast_path_body_bytes, 5 * 1024 * 1024)
 
-    def test_http_timeout_allows_idle_streaming_reads(self):
-        timeout = tunnel_client._http_timeout_for_tunnel()
-        self.assertIsNone(timeout.read)
-        self.assertEqual(timeout.connect, 60.0)
-        self.assertEqual(timeout.write, 60.0)
-        self.assertEqual(timeout.pool, 60.0)
+    def test_http_timeout_preserves_legacy_environment_contract(self):
+        cases = ((None, 600.0), ("7200", 7200.0), ("invalid", 600.0))
+        for raw, expected in cases:
+            env = {} if raw is None else {"YR_TUNNEL_HTTP_TIMEOUT": raw}
+            with self.subTest(raw=raw), mock.patch.dict(os.environ, env, clear=True):
+                timeout = self._capture_http_timeout()
+            self.assertEqual(timeout.connect, expected)
+            self.assertEqual(timeout.read, expected)
+            self.assertEqual(timeout.write, expected)
+            self.assertEqual(timeout.pool, expected)
 
     def test_invalid_tunnel_limit_is_rejected_at_construction(self):
         with mock.patch.dict(
@@ -947,8 +1043,8 @@ class TunnelClientTlsTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(connection_count, 3)
         create_context.assert_called_once_with(cafile=None)
         create_http_context.assert_called_once_with(verify=True, trust_env=False)
-        self.assertEqual(http_client_count, 3)
-        self.assertEqual(http_client_close_count, 3)
+        self.assertEqual(http_client_count, 1)
+        self.assertEqual(http_client_close_count, 1)
         self.assertEqual(reconnect_sleep.await_count, 2)
         self.assertTrue(all(context is expected_context for context in ssl_contexts))
         self.assertTrue(
