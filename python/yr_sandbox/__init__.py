@@ -6,9 +6,12 @@ from .types import (
     Mount,
     NetworkPolicy,
     NodeInfo,
+    PauseResult,
     PortForwarding,
     S3Config,
     SandboxInfo,
+    SnapshotInfo,
+    ResumeResult,
 )
 
 SDK_CAPABILITIES = frozenset(
@@ -28,12 +31,16 @@ __all__ = [
     "Pty",
     "PtySession",
     "PtyError",
+    "SandboxError",
     # data types
     "ConnectionConfig",
     "EntryInfo",
     "CommandResult",
     "CommandInfo",
     "SandboxInfo",
+    "SnapshotInfo",
+    "PauseResult",
+    "ResumeResult",
     "Mount",
     "NetworkPolicy",
     "S3Config",
@@ -47,6 +54,7 @@ __all__ = [
 # don't pay for the httpx/websockets import up front.
 _lazy_imports = {
     "Sandbox": ".sandbox_api",
+    "SandboxError": "._transport",
     "Shell": ".shell",
     "Shells": ".shell",
     "CommandHandle": ".commands",

@@ -216,6 +216,37 @@ class SandboxInfo:
 
 
 @dataclass(frozen=True)
+class SnapshotInfo:
+    """Stable public identity and aliases of a reusable Snapshot."""
+
+    snapshot_id: str
+    names: Tuple[str, ...] = ()
+
+
+@dataclass(frozen=True)
+class PauseResult:
+    """Authoritative result of a synchronous sandbox Pause."""
+
+    sandbox_id: str
+    snapshot_id: str
+    size: int
+    state: str
+    expires_at: int
+
+
+@dataclass(frozen=True)
+class ResumeResult:
+    """Authoritative result of a synchronous sandbox Resume."""
+
+    sandbox_id: str
+    state: str
+    route_address: str
+    function_proxy_id: str
+    node_id: str
+    port_mappings: Mapping[str, int]
+
+
+@dataclass(frozen=True)
 class S3Config:
     """S3 object storage configuration."""
 

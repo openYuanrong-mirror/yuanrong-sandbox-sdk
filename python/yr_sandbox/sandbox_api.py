@@ -9,10 +9,10 @@ import logging
 import os
 import re
 from collections.abc import Mapping
-from typing import Any, Dict, List, Optional, Union
+from typing import Any, Dict, List, Optional, Tuple, Union
 from urllib.parse import urlparse
 
-from ._transport import SandboxClient
+from ._transport import SandboxClient, SandboxError
 from .commands import Commands
 from .filesystem import Filesystem
 from .pty import Pty
@@ -21,9 +21,12 @@ from .types import (
     ConnectionConfig,
     Mount,
     NetworkPolicy,
+    PauseResult,
     PortForwarding,
     S3Config,
     SandboxInfo,
+    SnapshotInfo,
+    ResumeResult,
 )
 
 logger = logging.getLogger(__name__)
@@ -175,6 +178,111 @@ class Sandbox:
             result = await sh.run("echo $FOO")  # → bar
     """
 
+    @classmethod
+    def create(
+        cls,
+        snapshot_id: Union[str, SnapshotInfo],
+        **kwargs: Any,
+    ) -> "Sandbox":
+        """Create a new sandbox by restoring a READY reusable Snapshot."""
+        value = (
+            snapshot_id.snapshot_id
+            if isinstance(snapshot_id, SnapshotInfo)
+            else snapshot_id
+        )
+        return cls(snapshot_id=value, **kwargs)
+
+    @staticmethod
+    def _snapshot_info(payload: Mapping[str, Any]) -> SnapshotInfo:
+        snapshot_id = str(payload.get("snapshotId") or "")
+        names = payload.get("names") or []
+        if (
+            not snapshot_id
+            or not isinstance(names, list)
+            or not all(isinstance(name, str) for name in names)
+        ):
+            raise SandboxError("invalid reusable Snapshot response")
+        return SnapshotInfo(snapshot_id=snapshot_id, names=tuple(names))
+
+    @staticmethod
+    def _get_snapshot(client: Any, snapshot_id: str) -> SnapshotInfo:
+        return Sandbox._snapshot_info(client.get_snapshot(snapshot_id))
+
+    @staticmethod
+    def _list_snapshots(
+        client: Any,
+        *,
+        name: Optional[str] = None,
+        page_token: Optional[str] = None,
+        page_size: Optional[int] = None,
+    ) -> Tuple[List[SnapshotInfo], str]:
+        payload = client.list_snapshots(
+            name=name,
+            page_token=page_token,
+            page_size=page_size,
+        )
+        snapshots = payload.get("items") or []
+        if not isinstance(snapshots, list):
+            raise SandboxError("invalid reusable Snapshot list response")
+        return (
+            [Sandbox._snapshot_info(item) for item in snapshots],
+            str(payload.get("nextPageToken") or ""),
+        )
+
+    @staticmethod
+    def _delete_snapshot(client: Any, snapshot_id: str) -> None:
+        client.delete_snapshot(snapshot_id)
+
+    @classmethod
+    def get_snapshot(cls, snapshot_id: str) -> SnapshotInfo:
+        if not isinstance(snapshot_id, str) or not snapshot_id.strip():
+            raise ValueError("snapshot_id must be a non-empty string")
+        client = SandboxClient()
+        try:
+            return cls._get_snapshot(client, snapshot_id.strip())
+        finally:
+            client.close()
+
+    @classmethod
+    def list_snapshots(
+        cls,
+        *,
+        name: Optional[str] = None,
+        page_token: Optional[str] = None,
+        page_size: Optional[int] = None,
+    ) -> Tuple[List[SnapshotInfo], str]:
+        if name is not None and (
+            not isinstance(name, str) or not name.strip()
+        ):
+            raise ValueError("name must be a non-empty string or None")
+        if page_token is not None and not isinstance(page_token, str):
+            raise TypeError("page_token must be a string or None")
+        if page_size is not None:
+            if isinstance(page_size, bool) or not isinstance(page_size, int):
+                raise TypeError("page_size must be an integer or None")
+            if page_size <= 0:
+                raise ValueError("page_size must be greater than 0")
+        client = SandboxClient()
+        try:
+            return cls._list_snapshots(
+                client,
+                name=name.strip() if name is not None else None,
+                page_token=page_token,
+                page_size=page_size,
+            )
+        finally:
+            client.close()
+
+    @classmethod
+    def delete_snapshot(cls, snapshot_id: str) -> None:
+        if not isinstance(snapshot_id, str) or not snapshot_id.strip():
+            raise ValueError("snapshot_id must be a non-empty string")
+        client = SandboxClient()
+        try:
+            cls._delete_snapshot(client, snapshot_id.strip())
+        finally:
+            client.close()
+
     def __init__(
         self,
         image: Optional[str] = None,
@@ -197,6 +305,7 @@ class Sandbox:
         detached: bool = False,
         node_id: Optional[str] = None,
         *,
+        snapshot_id: Optional[str] = None,
         xpu: Optional[str] = None,
         storage_mb: Optional[int] = None,
         storage_limit_mb: int = 0,
@@ -255,6 +364,10 @@ class Sandbox:
             raise TypeError("rootfs must be an S3Config")
         if image is not None and rootfs is not None:
             raise ValueError("image and rootfs are mutually exclusive")
+        if snapshot_id is not None and (
+            not isinstance(snapshot_id, str) or not snapshot_id.strip()
+        ):
+            raise ValueError("snapshot_id must be a non-empty string")
         if env is not None and (
             not isinstance(env, Mapping)
             or not all(
@@ -364,11 +477,14 @@ class Sandbox:
         )
         body: Dict[str, Any] = {
             "namespace": "default",
+            "snapshotId": snapshot_id.strip() if snapshot_id is not None else None,
             "idleTimeoutSeconds": idle_timeout,
             "createTimeoutSeconds": resolved_create_timeout,
             "scheduleTimeoutSeconds": resolved_schedule_timeout,
             "rootfs": {"runtime": runtime},
         }
+        if body["snapshotId"] is None:
+            del body["snapshotId"]
         if image:
             body["rootfs"].update(
                 {
@@ -583,9 +699,19 @@ class Sandbox:
             raise ValueError(
                 f"Port {port} is not in forwarded ports: {self._forwarded_ports}"
             )
-        gateway = _gateway_address(self._connection)
+        connection = getattr(self, "_connection", None)
+        gateway = _gateway_address(connection)
+        if connection is not None:
+            tls = _gateway_uses_tls(connection)
+        elif os.environ.get("YR_GATEWAY_ADDRESS", "").strip():
+            tls_setting = os.environ.get("YR_GATEWAY_TLS", "0")
+            tls = tls_setting.strip().lower() not in ("0", "false", "no")
+        else:
+            tls_setting = os.environ.get("YR_TLS", "1")
+            tls = tls_setting.strip().lower() not in ("0", "false", "no")
+        scheme = "https" if tls else "http"
         safe_id = self._client._safe_id(self._sid)
-        return f"http://{gateway}/{safe_id}/{port}"
+        return f"{scheme}://{gateway}/{safe_id}/{port}"
 
     # ── reverse tunnel ──────────────────────────────────────────────────
 
@@ -630,6 +756,63 @@ class Sandbox:
             memory=info.get("required_mem", self._memory),
             image=info.get("image", self._image),
         )
+
+    def create_snapshot(self, *, name: Optional[str] = None) -> SnapshotInfo:
+        """Create a non-expiring reusable Snapshot and keep this sandbox running."""
+        if self._closed:
+            raise RuntimeError("sandbox is closed")
+        if name is not None and (
+            not isinstance(name, str) or not name.strip()
+        ):
+            raise ValueError("name must be a non-empty string or None")
+        return self._snapshot_info(
+            self._client.create_snapshot(
+                self._sid,
+                name=name.strip() if name is not None else None,
+            )
+        )
+
+    def pause(self, ttl_seconds: int = 90_000) -> PauseResult:
+        """Synchronously pause this sandbox and return its durable snapshot."""
+        if isinstance(ttl_seconds, bool) or not isinstance(ttl_seconds, int):
+            raise ValueError("ttl_seconds must be a positive integer")
+        if ttl_seconds <= 0:
+            raise ValueError("ttl_seconds must be a positive integer")
+        if self._closed:
+            raise RuntimeError("sandbox is closed")
+        result = self._client.pause(self._sid, ttl_seconds)
+        pause = PauseResult(
+            sandbox_id=str(result.get("sandboxId") or ""),
+            snapshot_id=str(result.get("snapshotId") or ""),
+            size=int(result.get("size") or 0),
+            state=str(result.get("state") or ""),
+            expires_at=int(result.get("expiresAt") or 0),
+        )
+        if (pause.sandbox_id != self._sid or pause.state != "paused"
+                or not pause.snapshot_id or pause.size <= 0 or pause.expires_at <= 0):
+            raise SandboxError("pause response is not an authoritative PAUSED result")
+        return pause
+
+    def resume(self) -> ResumeResult:
+        """Synchronously resume this sandbox and return the RUNNING route."""
+        if self._closed:
+            raise RuntimeError("sandbox is closed")
+        result = self._client.resume(self._sid)
+        mappings = result.get("portMappings") or {}
+        if not isinstance(mappings, Mapping):
+            raise RuntimeError("resume response portMappings must be an object")
+        resume = ResumeResult(
+            sandbox_id=str(result.get("sandboxId") or ""),
+            state=str(result.get("state") or ""),
+            route_address=str(result.get("routeAddress") or ""),
+            function_proxy_id=str(result.get("functionProxyId") or ""),
+            node_id=str(result.get("nodeId") or ""),
+            port_mappings={str(key): int(value) for key, value in mappings.items()},
+        )
+        if (resume.sandbox_id != self._sid or resume.state != "running"
+                or not resume.route_address or not resume.function_proxy_id):
+            raise SandboxError("resume response is not an authoritative RUNNING result")
+        return resume
 
     def _close(self, *, delete_remote: bool) -> None:
         if self._closed:

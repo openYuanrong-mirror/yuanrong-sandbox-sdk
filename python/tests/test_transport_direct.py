@@ -380,6 +380,118 @@ def test_delete_transport_retries_are_bounded_and_contextual():
     print("ok: delete transport retries are bounded and contextual")
 
 
+def test_pause_and_resume_retry_with_one_internal_request_id_per_call():
+    pause_attempts = []
+    resume_attempts = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        request_id = request.headers.get("X-YR-Request-ID")
+        body = json.loads(request.read())
+        if request.url.path.endswith("/pause"):
+            pause_attempts.append((request_id, body))
+            if len(pause_attempts) == 1:
+                raise httpx.ReadError("pause response lost", request=request)
+            if len(pause_attempts) == 2:
+                return httpx.Response(502, text="bad gateway")
+            return httpx.Response(
+                200,
+                json=_envelope(
+                    {
+                        "sandboxId": "default-sandbox-1",
+                        "snapshotId": request_id,
+                        "size": 8192,
+                        "state": "paused",
+                        "expiresAt": 1_800_000_000,
+                    }
+                ),
+            )
+        if request.url.path.endswith("/resume"):
+            resume_attempts.append((request_id, body))
+            if len(resume_attempts) == 1:
+                return httpx.Response(503, text="temporarily unavailable")
+            return httpx.Response(
+                200,
+                json=_envelope(
+                    {
+                        "sandboxId": "default-sandbox-1",
+                        "state": "running",
+                        "routeAddress": "10.0.0.8:9000",
+                        "functionProxyId": "proxy-a",
+                        "nodeId": "node-a",
+                        "portMappings": {"8080": 41080},
+                    }
+                ),
+            )
+        raise AssertionError(f"unexpected lifecycle path: {request.url.path}")
+
+    client = _make_client(handler)
+    _check(callable(getattr(client, "pause", None)), "SandboxClient.pause must exist")
+    _check(callable(getattr(client, "resume", None)), "SandboxClient.resume must exist")
+    pause = client.pause("default-sandbox-1", 90_000)
+    resume = client.resume("default-sandbox-1")
+
+    _check(len(pause_attempts) == 3, f"pause attempts: {pause_attempts}")
+    _check(
+        len({attempt[0] for attempt in pause_attempts}) == 1,
+        f"pause request id changed: {pause_attempts}",
+    )
+    _check(
+        pause_attempts[0][0].startswith("pause-"),
+        f"pause request id: {pause_attempts}",
+    )
+    _check(
+        {attempt[1]["ttlSeconds"] for attempt in pause_attempts} == {90_000},
+        f"pause ttl changed: {pause_attempts}",
+    )
+    _check(
+        pause["snapshotId"] == pause_attempts[0][0],
+        f"snapshot id did not reuse request id: {pause}",
+    )
+    _check(len(resume_attempts) == 2, f"resume attempts: {resume_attempts}")
+    _check(
+        len({attempt[0] for attempt in resume_attempts}) == 1,
+        f"resume request id changed: {resume_attempts}",
+    )
+    _check(
+        resume_attempts[0][0].startswith("resume-"),
+        f"resume request id: {resume_attempts}",
+    )
+    _check(
+        pause_attempts[0][0] != resume_attempts[0][0],
+        "distinct lifecycle calls reused one request id",
+    )
+    _check(resume["state"] == "running", f"resume result: {resume}")
+    print("ok: pause and resume retry with stable internal request identity")
+
+
+def test_pause_rejects_snapshot_identity_not_owned_by_internal_request():
+    seen_request_id = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        seen_request_id.append(request.headers.get("X-YR-Request-ID"))
+        return httpx.Response(
+            200,
+            json=_envelope(
+                {
+                    "sandboxId": "default-sandbox-1",
+                    "snapshotId": "pause-someone-elses-request",
+                    "size": 8192,
+                    "state": "paused",
+                    "expiresAt": 1_800_000_000,
+                }
+            ),
+        )
+
+    client = _make_client(handler)
+    try:
+        client.pause("default-sandbox-1", 90_000)
+        raise AssertionError("mismatched pause snapshot identity unexpectedly succeeded")
+    except SandboxError as exc:
+        _check("does not match" in str(exc), f"unexpected pause identity error: {exc}")
+    _check(len(seen_request_id) == 1, f"business mismatch was retried: {seen_request_id}")
+    print("ok: pause rejects mismatched authoritative snapshot identity")
+
+
 def test_sandbox_create_timeout_precedence_and_body():
     import yr_sandbox.sandbox_api as sandbox_api
 
@@ -1496,6 +1608,8 @@ if __name__ == "__main__":
     test_create_rejects_stream_without_final()
     test_sandbox_create_timeout_precedence_and_body()
     test_sandbox_create_timeout_validation()
+    test_pause_and_resume_retry_with_one_internal_request_id_per_call()
+    test_pause_rejects_snapshot_identity_not_owned_by_internal_request()
     test_direct_success_no_fallback()
     test_direct_503_retries_with_same_request_id()
     test_direct_read_timeout_retries_with_same_request_id()

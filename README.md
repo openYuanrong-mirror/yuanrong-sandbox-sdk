@@ -65,8 +65,8 @@ variables. Omitting it preserves the environment-based behavior below.
 | `YR_SERVER_ADDRESS` | Frontend gateway `host:port`. Used for lifecycle, invoke, and `/direct` file IO. |
 | `YR_TOKEN` | JWT sent as raw `X-Auth: <token>` on authenticated frontend routes. Do not use `Authorization: Bearer`. |
 | `YR_TLS` | `1/true/yes` selects `https://` for frontend routes; `0/false/no` selects plaintext HTTP. |
-| `YR_GATEWAY_ADDRESS` | Optional sandbox gateway/router host for reverse tunnel and user port URLs; falls back to `YR_SERVER_ADDRESS`. |
-| `YR_GATEWAY_TLS` | `1/true/yes` selects `wss://` for `/tunnel`; default is plaintext `ws://`. |
+| `YR_GATEWAY_ADDRESS` | Optional gateway/router `host:port` for reverse tunnel and user port URLs; falls back to `YR_SERVER_ADDRESS`. |
+| `YR_GATEWAY_TLS` | `1/true/yes` selects `wss://` for `/tunnel` and `https://` for user port URLs; default is plaintext. |
 
 ### Control plane
 
@@ -116,7 +116,7 @@ SDKs should not expose it.
 | Surface | URL shape | Notes |
 | --- | --- | --- |
 | Reverse tunnel | `/tunnel/{safeID}` | SDK connects a local upstream to the gateway; default is plaintext `ws://` and does not send `YR_TOKEN`. |
-| User port forwarding | `http://<gateway>/<safeID>/<port>` | Returned by SDK `get_port_url(port)` for ports requested at create time. User service ports are public at router layer. |
+| User port forwarding | `http://<sandbox-router>/<safeID>/<port>` | Returned by SDK `get_port_url(port)` for ports requested at create time. User service ports are public at router layer. |
 
 The shared action envelope is always `{"action": <name>, "args": {...}}`.
 Supported action names include process (`process.exec`, `process.start`,
