@@ -32,7 +32,7 @@ class _PTY:
 
 
 class LifecycleTests(unittest.TestCase):
-    def test_get_port_url_prefers_independent_sandbox_router(self):
+    def test_get_port_url_ignores_legacy_sandbox_router_overrides(self):
         sandbox = object.__new__(Sandbox)
         sandbox._sid = "default-sandbox-1"
         sandbox._forwarded_ports = {8080}
@@ -51,12 +51,13 @@ class LifecycleTests(unittest.TestCase):
                 "YR_GATEWAY_ADDRESS": "frontend-gateway:9443",
                 "YR_GATEWAY_TLS": "1",
                 "YR_SANDBOX_ROUTER_ADDRESS": "sandbox-router:8080",
+                "YR_SANDBOX_ROUTER_TLS": "0",
             },
             clear=True,
         ):
             self.assertEqual(
                 sandbox.get_port_url(8080),
-                "http://sandbox-router:8080/default-sandbox-1/8080",
+                "https://frontend-gateway:9443/default-sandbox-1/8080",
             )
 
     def test_get_port_url_uses_gateway_tls_without_changing_pty_routing(self):

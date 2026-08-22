@@ -699,22 +699,16 @@ class Sandbox:
             raise ValueError(
                 f"Port {port} is not in forwarded ports: {self._forwarded_ports}"
             )
-        router = os.environ.get("YR_SANDBOX_ROUTER_ADDRESS", "").strip()
-        if router:
-            gateway = router
-            tls_setting = os.environ.get("YR_SANDBOX_ROUTER_TLS", "0")
+        connection = getattr(self, "_connection", None)
+        gateway = _gateway_address(connection)
+        if connection is not None:
+            tls = _gateway_uses_tls(connection)
+        elif os.environ.get("YR_GATEWAY_ADDRESS", "").strip():
+            tls_setting = os.environ.get("YR_GATEWAY_TLS", "0")
             tls = tls_setting.strip().lower() not in ("0", "false", "no")
         else:
-            connection = getattr(self, "_connection", None)
-            gateway = _gateway_address(connection)
-            if connection is not None:
-                tls = _gateway_uses_tls(connection)
-            elif os.environ.get("YR_GATEWAY_ADDRESS", "").strip():
-                tls_setting = os.environ.get("YR_GATEWAY_TLS", "0")
-                tls = tls_setting.strip().lower() not in ("0", "false", "no")
-            else:
-                tls_setting = os.environ.get("YR_TLS", "1")
-                tls = tls_setting.strip().lower() not in ("0", "false", "no")
+            tls_setting = os.environ.get("YR_TLS", "1")
+            tls = tls_setting.strip().lower() not in ("0", "false", "no")
         scheme = "https" if tls else "http"
         safe_id = self._client._safe_id(self._sid)
         return f"{scheme}://{gateway}/{safe_id}/{port}"

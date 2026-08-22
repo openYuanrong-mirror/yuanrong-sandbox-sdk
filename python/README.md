@@ -153,10 +153,8 @@ variables. If it is omitted, the SDK keeps the existing environment fallback:
 | `YR_SERVER_ADDRESS` | Frontend gateway `host:port` for lifecycle, invoke, direct file IO. Required. |
 | `YR_TOKEN` | JWT sent in `X-Auth` where required. |
 | `YR_TLS` | Set `1/true/yes` to use HTTPS for frontend control routes. Default: `0`. |
-| `YR_GATEWAY_ADDRESS` | Optional frontend gateway `host:port` for reverse tunnel routes. Falls back to `YR_SERVER_ADDRESS`. |
-| `YR_GATEWAY_TLS` | Set `1/true/yes` to use WSS for gateway tunnel routes. Default: `0`. |
-| `YR_SANDBOX_ROUTER_ADDRESS` | Optional direct SandboxRouter `host:port` for user port URLs. Falls back to `YR_GATEWAY_ADDRESS`, then `YR_SERVER_ADDRESS`. |
-| `YR_SANDBOX_ROUTER_TLS` | Set `1/true/yes` to use HTTPS for direct SandboxRouter user port URLs. Default: `0`. |
+| `YR_GATEWAY_ADDRESS` | Optional gateway/router `host:port` for reverse tunnel and user port URLs. Falls back to `YR_SERVER_ADDRESS`. |
+| `YR_GATEWAY_TLS` | Set `1/true/yes` to use WSS for gateway tunnel routes and HTTPS for user port URLs. Default: `0`. |
 | `YR_TUNNEL_CONNECT_TIMEOUT` | Reverse tunnel WebSocket connection wait in seconds. Default: `60`. |
 | `YR_TUNNEL_PROTOCOL_VERSION` | Highest reverse-tunnel protocol version to advertise. Default/cap: `2`. |
 | `YR_TUNNEL_MAX_BODY_SIZE` | Per-request or response HTTP body bound advertised to the peer. HTTP bodies are streamed. Default: `512 MiB`; cap: `1 GiB`. |

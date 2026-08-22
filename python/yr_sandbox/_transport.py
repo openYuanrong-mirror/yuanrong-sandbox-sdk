@@ -11,8 +11,7 @@ from these environment variables::
 
     YR_SERVER_ADDRESS   host:port of the frontend gateway (required)
     YR_TOKEN            JWT, sent in the ``X-Auth`` header (required)
-    YR_GATEWAY_ADDRESS  optional frontend gateway for reverse tunnel URLs
-    YR_SANDBOX_ROUTER_ADDRESS  optional direct router for user port URLs
+    YR_GATEWAY_ADDRESS  optional gateway for reverse tunnel and user port URLs
 
 Response format:
 - Auth uses the raw JWT in the ``X-Auth`` header (no ``Bearer`` prefix).

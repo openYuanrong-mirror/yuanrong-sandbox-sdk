@@ -65,10 +65,8 @@ variables. Omitting it preserves the environment-based behavior below.
 | `YR_SERVER_ADDRESS` | Frontend gateway `host:port`. Used for lifecycle, invoke, and `/direct` file IO. |
 | `YR_TOKEN` | JWT sent as raw `X-Auth: <token>` on authenticated frontend routes. Do not use `Authorization: Bearer`. |
 | `YR_TLS` | `1/true/yes` selects `https://` for frontend routes; `0/false/no` selects plaintext HTTP. |
-| `YR_GATEWAY_ADDRESS` | Optional frontend gateway for reverse tunnel routes; falls back to `YR_SERVER_ADDRESS`. |
-| `YR_GATEWAY_TLS` | `1/true/yes` selects `wss://` for `/tunnel`; default is plaintext `ws://`. |
-| `YR_SANDBOX_ROUTER_ADDRESS` | Optional direct SandboxRouter `host:port` for user port URLs; falls back to `YR_GATEWAY_ADDRESS`, then `YR_SERVER_ADDRESS`. |
-| `YR_SANDBOX_ROUTER_TLS` | `1/true/yes` selects `https://` for the direct SandboxRouter; default is plaintext `http://`. |
+| `YR_GATEWAY_ADDRESS` | Optional gateway/router `host:port` for reverse tunnel and user port URLs; falls back to `YR_SERVER_ADDRESS`. |
+| `YR_GATEWAY_TLS` | `1/true/yes` selects `wss://` for `/tunnel` and `https://` for user port URLs; default is plaintext. |
 
 ### Control plane
 
