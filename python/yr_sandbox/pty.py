@@ -53,15 +53,23 @@ def _normalize_command(command: str | Sequence[str]) -> list[str]:
 
 def _use_tls(connection: ConnectionConfig | None = None) -> bool:
     if connection is not None:
-        if connection.gateway_address is not None:
-            return connection.gateway_use_tls
         return connection.use_tls
+    if os.environ.get("YR_SERVER_ADDRESS", "").strip():
+        raw = os.environ.get("YR_TLS", "1")
+        return raw.strip().lower() not in ("0", "false", "no")
     gateway = os.environ.get("YR_GATEWAY_ADDRESS", "").strip()
     if gateway:
         raw = os.environ.get("YR_GATEWAY_TLS", "0")
     else:
         raw = os.environ.get("YR_TLS", "1")
     return raw.strip().lower() not in ("0", "false", "no")
+
+
+def _pty_server() -> str:
+    return (
+        os.environ.get("YR_SERVER_ADDRESS", "").strip()
+        or os.environ.get("YR_GATEWAY_ADDRESS", "").strip()
+    )
 
 
 def _ssl_context(use_tls: bool) -> ssl.SSLContext | None:
@@ -179,20 +187,15 @@ class Pty:
 
         if self._connection_config is not None:
             token = self._connection_config.token
-            server = (
-                self._connection_config.gateway_address
-                or self._connection_config.server_address
-            )
+            server = self._connection_config.server_address
         else:
             token = os.environ.get("YR_TOKEN", "").strip()
             if not token:
                 raise RuntimeError("YR_TOKEN is not set")
-            server = os.environ.get("YR_GATEWAY_ADDRESS", "").strip()
-            if not server:
-                server = os.environ.get("YR_SERVER_ADDRESS", "").strip()
+            server = _pty_server()
             if not server:
                 raise RuntimeError(
-                    "YR_GATEWAY_ADDRESS or YR_SERVER_ADDRESS is not set"
+                    "YR_SERVER_ADDRESS or YR_GATEWAY_ADDRESS is not set"
                 )
         use_tls = _use_tls(self._connection_config)
         uri = _build_pty_uri(

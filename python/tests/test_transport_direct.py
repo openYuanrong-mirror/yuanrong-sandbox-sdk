@@ -1382,6 +1382,37 @@ def test_tunnel_client_keeps_http_req_dedup_cache():
     print("ok: TunnelClient has http_req id dedup/replay cache")
 
 
+def test_direct_entry_uses_server_and_ignores_plain_gateway_entry():
+    old_env = {
+        name: os.environ.get(name)
+        for name in (
+            "YR_SERVER_ADDRESS",
+            "YR_TLS",
+            "YR_GATEWAY_ADDRESS",
+            "YR_GATEWAY_TLS",
+        )
+    }
+    try:
+        os.environ["YR_SERVER_ADDRESS"] = "edge-tls:8443"
+        os.environ["YR_TLS"] = "1"
+        os.environ["YR_GATEWAY_ADDRESS"] = "edge-plain:8080"
+        os.environ["YR_GATEWAY_TLS"] = "0"
+        client = SandboxClient(token="test-token")
+        _check(
+            client._direct_base == "https://edge-tls:8443/direct",
+            f"plain gateway leaked into direct entry: {client._direct_base}",
+        )
+        client.close()
+
+    finally:
+        for name, value in old_env.items():
+            if value is None:
+                os.environ.pop(name, None)
+            else:
+                os.environ[name] = value
+    print("ok: required direct entry uses YR_SERVER_ADDRESS, not plain gateway")
+
+
 def test_reverse_tunnel_url_uses_gateway_tunnel_alias():
     import yr_sandbox.sandbox_api as sandbox_api
     import yr_sandbox.tunnel_client as tunnel_client
@@ -1679,6 +1710,7 @@ if __name__ == "__main__":
     test_direct_invoke_sends_request_id_header_and_body()
     test_resumable_download_continues_from_part_file()
     test_tunnel_client_keeps_http_req_dedup_cache()
+    test_direct_entry_uses_server_and_ignores_plain_gateway_entry()
     test_copy_from_local_dir_streams_direct_tar_upload()
     test_copy_to_local_dir_uses_direct_tar_download()
     test_reverse_tunnel_url_uses_gateway_tunnel_alias()

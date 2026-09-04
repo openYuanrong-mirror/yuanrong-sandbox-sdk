@@ -1,7 +1,7 @@
 """Filesystem helpers for sandbox v1.
 
-Small file operations use frontend invoke actions. Binary file and directory
-copy paths prefer the frontend ``/direct`` route so large payloads avoid JSON
+Small file operations use Frontend invoke actions. Binary file and directory
+copy paths prefer the ``/direct`` route so large payloads avoid JSON
 envelopes. The RRT direct route is a published sandbox target and remains
 available under a block-network policy; RuntimeRPC chunks remain the bounded
 fallback for transport failures.
@@ -237,7 +237,7 @@ class Filesystem:
     def copy_from_local(self, local_path: str, remote_path: str) -> None:
         """Copy a local file or directory **into** the sandbox.
 
-        Files use the frontend ``/direct`` binary upload path. Directories are
+        Files use the ``/direct`` binary upload path. Directories are
         packed as a tar archive and uploaded over the same HTTP binary path.
         """
         if not os.path.exists(local_path):

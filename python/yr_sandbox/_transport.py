@@ -9,12 +9,13 @@ Small control-plane requests use the unified sandbox action model::
 Connection settings may be passed explicitly with ``ConnectionConfig`` or read
 from these environment variables::
 
-    YR_SERVER_ADDRESS   host:port of the frontend gateway (required)
-    YR_TOKEN            JWT, sent in the ``X-Auth`` header (required)
-    YR_GATEWAY_ADDRESS  optional gateway for reverse tunnel and user port URLs
+    YR_SERVER_ADDRESS   host:port of the primary service entry (required)
+    YR_GATEWAY_ADDRESS  optional gateway for tunnel/port-forward traffic
+    YR_TOKEN            JWT used by both entries (required)
 
 Response format:
-- Auth uses the raw JWT in the ``X-Auth`` header (no ``Bearer`` prefix).
+- Frontend control requests use the existing raw ``X-Auth`` contract.
+- Direct-route requests use standard ``Authorization: Bearer <JWT>``.
 - Frontend responses use ``{"code", "message", "data"}``; ``data`` is a
   base64-encoded JSON result and is decoded by this client.
 """
@@ -38,6 +39,44 @@ logger = logging.getLogger(__name__)
 
 class SandboxError(RuntimeError):
     """Raised when the frontend returns a non-2xx response or an error body."""
+
+    def __init__(self, message: str, *, request_id: Optional[str] = None):
+        super().__init__(message)
+        self.request_id = request_id
+
+
+class SandboxNotFound(SandboxError):
+    def __init__(self, sandbox_id: str, message: Optional[str] = None):
+        super().__init__(message or f"sandbox {sandbox_id} was not found")
+        self.sandbox_id = sandbox_id
+
+
+class PermissionDenied(SandboxError):
+    def __init__(self, sandbox_id: str, message: Optional[str] = None):
+        super().__init__(message or f"permission denied for sandbox {sandbox_id}")
+        self.sandbox_id = sandbox_id
+
+
+class SandboxHTTPError(SandboxError):
+    def __init__(
+        self,
+        status_code: int,
+        payload: Dict[str, Any],
+        message: str,
+        *,
+        request_id: Optional[str] = None,
+    ):
+        super().__init__(message, request_id=request_id)
+        self.status_code = status_code
+        self.payload = payload
+
+
+class _InvokeResult(dict):
+    """Action result carrying transport metadata outside its public mapping."""
+
+    def __init__(self, value: Dict[str, Any], request_id: str):
+        super().__init__(value)
+        self.request_id = request_id
 
 
 class _RetryableHTTPStatus(SandboxError):
@@ -128,17 +167,13 @@ class SandboxClient:
             scheme,
             self._server,
             connection.verify_tls,
-            self._token,
+            connection.resolved_token,
         )
 
-        # ── HTTP-direct-via-frontend /direct route ──────────────────────────
-        # RRT direct invoke is a control-plane fast path, so it follows the
-        # normal frontend gateway (YR_SERVER_ADDRESS / YR_TLS) rather than the
-        # data-plane addresses used by tunnel and user port URLs. The frontend
-        # exposes /direct and forwards it to sandboxRouter after frontend JWT
-        # auth. The frontend owns the RRT control-port mapping, so clients do
-        # not expose the internal RRT port in the URL:
-        #   POST {server}/direct/{safeID}/invoke  {action, args}
+        # ── HTTP direct via the primary service entry ──────────────────────
+        # Required /direct traffic always shares YR_SERVER_ADDRESS + YR_TLS.
+        # YR_GATEWAY_ADDRESS is intentionally not consulted here: it can point
+        # at the optional plaintext tunnel/port-forward listener.
         self._rrt_port = int(
             os.environ.get("YR_RRT_PORT", "50090").strip() or "50090"
         )
@@ -555,6 +590,10 @@ class SandboxClient:
             params={"instance_id": sandbox_id},
             timeout=60,
         )
+        if resp.status_code == 404:
+            raise SandboxNotFound(sandbox_id)
+        if resp.status_code == 403:
+            raise PermissionDenied(sandbox_id)
         if resp.status_code >= 400:
             raise SandboxError(
                 f"get instance {sandbox_id} failed: "
@@ -573,7 +612,7 @@ class SandboxClient:
         for item in payload:
             if isinstance(item, dict) and item.get("id") == sandbox_id:
                 return item
-        raise SandboxError(f"sandbox {sandbox_id} was not found")
+        raise SandboxNotFound(sandbox_id)
 
     # ── unified action invoke ──────────────────────────────────────────
 
@@ -606,7 +645,7 @@ class SandboxClient:
             else time.monotonic() + rpc_timeout
         )
 
-        # Prefer frontend /direct; fall back to frontend invoke.
+        # Prefer the /direct path; fall back to the control-plane invoke path.
         if self._direct_enabled and not self._direct_disabled:
             result, fell_back = self._invoke_direct(
                 sandbox_id,
@@ -616,25 +655,32 @@ class SandboxClient:
                 deadline,
             )
             if not fell_back:
-                return result
+                return _InvokeResult(result, request_id)
 
         fallback_timeout = self._remaining_timeout(deadline)
         if fallback_timeout is not None and fallback_timeout <= 0:
             raise SandboxError(
                 "invoke deadline exhausted before frontend fallback "
-                f"(requestId={request_id})"
+                f"(requestId={request_id})",
+                request_id=request_id,
             )
-        resp = self._http.post(
-            f"{self._base}/sandboxes/{sandbox_id}/invoke",
-            json={
-                "action": action,
-                "args": args or {},
-                "requestId": request_id,
-            },
-            timeout=fallback_timeout,
-            headers={"X-YR-Request-ID": request_id},
-        )
-        return self._json(resp)
+        try:
+            resp = self._http.post(
+                f"{self._base}/sandboxes/{sandbox_id}/invoke",
+                json={
+                    "action": action,
+                    "args": args or {},
+                    "requestId": request_id,
+                },
+                timeout=fallback_timeout,
+                headers={"X-YR-Request-ID": request_id},
+            )
+        except httpx.RequestError as error:
+            raise SandboxError(
+                f"frontend invoke outcome is unknown (requestId={request_id}): {error}",
+                request_id=request_id,
+            ) from error
+        return _InvokeResult(self._json(resp), request_id)
 
     def _invoke_direct(
         self,
@@ -644,17 +690,17 @@ class SandboxClient:
         request_id: str,
         deadline: Optional[float],
     ) -> "tuple[Dict[str, Any], bool]":
-        """Try the frontend /direct path. Returns ``(result, fell_back)``.
+        """Try the /direct path. Returns ``(result, fell_back)``.
 
         All attempts for one logical action reuse ``request_id``. RRT deduplicates
         direct requests by that id, so a retry can wait for or replay the first
         execution instead of repeating a side effect. ``fell_back=True`` is
         returned only after connect/pool failures (known not sent) are exhausted,
-        or when frontend reports that the direct route does not exist. An
+        or when the server reports that the direct route does not exist. An
         exhausted unknown-outcome failure is surfaced to the caller and is never
         replayed through RuntimeRPC.
 
-        Unlike frontend invoke, the RRT HTTP server returns raw result JSON (no
+        Unlike Frontend invoke, the RRT HTTP server returns raw result JSON (no
         base64 ``BuildJobResponse`` envelope); action-level errors live inside
         that object (HTTP 200).
         """
@@ -700,7 +746,8 @@ class SandboxClient:
                 self._direct_route_misses = 0
                 raise SandboxError(
                     "direct invoke outcome is unknown after transport failure "
-                    f"(requestId={request_id}): {exc}"
+                    f"(requestId={request_id}): {exc}",
+                    request_id=request_id,
                 ) from exc
             else:
                 if resp.status_code == 404:
@@ -727,16 +774,26 @@ class SandboxClient:
                     )
                     last_failure_safe = False
                 elif resp.status_code >= 400:
-                    raise SandboxError(
+                    try:
+                        payload = resp.json()
+                    except ValueError:
+                        payload = {"error": resp.text}
+                    if not isinstance(payload, dict):
+                        payload = {"error": str(payload)}
+                    raise SandboxHTTPError(
+                        resp.status_code,
+                        payload,
                         f"direct invoke failed: HTTP {resp.status_code} "
-                        f"(requestId={request_id}): {resp.text}"
+                        f"(requestId={request_id}): {resp.text}",
+                        request_id=request_id,
                     )
                 else:
                     try:
                         parsed = resp.json()
                     except ValueError as exc:
                         last_error = SandboxError(
-                            f"direct invoke returned invalid JSON: {exc}"
+                            f"direct invoke returned invalid JSON: {exc}",
+                            request_id=request_id,
                         )
                         last_failure_safe = False
                     else:
@@ -770,7 +827,8 @@ class SandboxClient:
         detail = last_error or "invoke deadline exhausted"
         raise SandboxError(
             "direct invoke outcome is unknown after "
-            f"{attempts} attempts (requestId={request_id}): {detail}"
+            f"{attempts} attempts (requestId={request_id}): {detail}",
+            request_id=request_id,
         ) from last_error
 
     @staticmethod
@@ -788,7 +846,7 @@ class SandboxClient:
         *,
         upload_type: str = "file",
     ) -> Dict[str, Any]:
-        """Upload a file/tar over the required frontend /direct binary data path."""
+        """Upload a file/tar over the required /direct binary data path."""
         content_len = os.path.getsize(local_path)
         if upload_type == "file" and content_len >= self._resume_min_size:
             return self._upload_file_resumable(
@@ -916,7 +974,7 @@ class SandboxClient:
         remote_path: str,
         rpc_timeout: Optional[float] = None,
     ) -> Dict[str, Any]:
-        """Upload bytes over the required frontend /direct binary data path."""
+        """Upload bytes over the required /direct binary data path."""
         return self._upload_direct(
             sandbox_id, data, remote_path, rpc_timeout, content_len=len(data)
         )
@@ -989,7 +1047,7 @@ class SandboxClient:
         *,
         download_type: str = "file",
     ) -> None:
-        """Download a file/tar over the required frontend /direct binary data path."""
+        """Download a file/tar over the required /direct binary data path."""
         if download_type == "file":
             return self._download_file_resumable(
                 sandbox_id, remote_path, local_path, rpc_timeout
@@ -1065,7 +1123,7 @@ class SandboxClient:
         remote_path: str,
         rpc_timeout: Optional[float] = None,
     ) -> bytes:
-        """Download bytes over the required frontend /direct binary data path."""
+        """Download bytes over the required /direct binary data path."""
         url = f"{self._direct_base}/{self._safe_id(sandbox_id)}/download"
         try:
             resp = self._http.get(
@@ -1083,11 +1141,11 @@ class SandboxClient:
 
     @property
     def direct_enabled(self) -> bool:
-        """Whether RRT direct invoke first tries the frontend /direct route."""
+        """Whether RRT direct invoke first tries the /direct route."""
         return self._direct_enabled
 
     def set_direct_enabled(self, enabled: bool) -> None:
-        """Select whether control operations may use the frontend direct path."""
+        """Select whether operations may use the direct data path."""
         if not isinstance(enabled, bool):
             raise TypeError("enabled must be a boolean")
         self._direct_enabled = enabled

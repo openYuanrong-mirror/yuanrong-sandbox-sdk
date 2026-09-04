@@ -426,6 +426,23 @@ PYTHONPATH=. python3 tests/e2e_rrt_direct.py
 PYTHONPATH=. python3 examples/reverse_tunnel.py
 ```
 
+## Runnable examples
+
+Only examples expected to run in ordinary SDK/K8S smoke environments are kept:
+
+- `examples/basic_usage.py`
+- `examples/command_stdin.py`
+- `examples/persistent_shell.py`
+- `examples/tunnel_large_response.py`
+- `examples/port_forwarding.py`
+- `examples/reverse_tunnel.py`
+- `examples/named_sandbox.py`
+- `examples/bench_cp.py`
+- `examples/recoverable_command.py`
+
+Infra-specific demos should be documented separately instead of being shipped as
+runnable SDK examples.
+
 ## Architecture
 
 - **Control plane** — sandbox v1 create, delete, lifecycle, and invoke routes.
@@ -435,3 +452,30 @@ PYTHONPATH=. python3 examples/reverse_tunnel.py
   upstream (`yr_sandbox/tunnel_client.py`).
 
 See [`TODO.md`](TODO.md) for remaining SDK work.
+
+## Recover a background command
+
+The SDK process does not persist command handles. Generate a command ID and
+persist the `(sandbox_id, command_id)` pair in the caller's own database before
+submission, then bind fresh handles after a restart:
+
+```python
+from yr_sandbox import Sandbox
+
+sandbox = Sandbox.from_id(saved_sandbox_id)
+command = sandbox.commands.run(
+    "python train.py",
+    background=True,
+    command_id=saved_command_id,  # generate and persist before submission
+)
+
+# In a later SDK process:
+sandbox = Sandbox.from_id(saved_sandbox_id)
+command = sandbox.commands.get(saved_command_id)
+result = command.wait()
+```
+
+`wait()` and `wait_async()` use one hidden multiplexed WebSocket per connection
+context as a notification channel. The final result is always read back from
+RRT's authoritative command registry. A local wait timeout or client restart
+does not terminate the remote command.

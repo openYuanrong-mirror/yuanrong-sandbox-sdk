@@ -12,6 +12,7 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 import pytest
 from yr_sandbox._http_pool import _SHARED_HTTP_CLIENT_REGISTRY
 from yr_sandbox._transport import SandboxClient
+from yr_sandbox.types import ConnectionConfig
 
 
 class _EchoHandler(BaseHTTPRequestHandler):
@@ -23,6 +24,7 @@ class _EchoHandler(BaseHTTPRequestHandler):
         body = json.dumps(
             {
                 "token": self.headers.get("X-Auth"),
+                "authorization": self.headers.get("Authorization"),
                 "cookie": self.headers.get("Cookie"),
                 "client_port": self.client_address[1],
             }
@@ -143,6 +145,49 @@ def test_put_uses_shared_client_and_request_token(monkeypatch):
         snapshot = _SHARED_HTTP_CLIENT_REGISTRY.snapshot()
         key = (os.getpid(), "http", address, False)
         assert snapshot[key][1] == 1
+    finally:
+        client.close()
+        _stop_server(server, thread)
+
+
+def test_control_and_data_plane_use_separate_auth_headers(monkeypatch):
+    server, thread = _start_server()
+    address = f"127.0.0.1:{server.server_port}"
+    client = _new_client(monkeypatch, address, "sandbox-token")
+    try:
+        control = client._http.get(f"http://{address}/api/v1/sandboxes", timeout=5).json()
+        direct = client._http.get(f"http://{address}/direct/instance-id/8080", timeout=5).json()
+
+        assert control["token"] == "sandbox-token"
+        assert control["authorization"] is None
+        assert direct["token"] is None
+        assert direct["authorization"] == "Bearer sandbox-token"
+    finally:
+        client.close()
+        _stop_server(server, thread)
+
+
+def test_token_provider_is_resolved_for_every_http_request(monkeypatch):
+    server, thread = _start_server()
+    address = f"127.0.0.1:{server.server_port}"
+    current = {"token": "token-a"}
+    connection = ConnectionConfig(
+        server_address=address,
+        token="initial-token",
+        use_tls=False,
+        token_provider=lambda: current["token"],
+    )
+    client = SandboxClient(connection=connection)
+    try:
+        first = client._http.get(f"http://{address}/echo", timeout=5).json()
+        current["token"] = "token-b"
+        second = client._http.get(
+            f"http://{address}/direct/sandbox/8080", timeout=5
+        ).json()
+
+        assert first["token"] == "token-a"
+        assert second["token"] is None
+        assert second["authorization"] == "Bearer token-b"
     finally:
         client.close()
         _stop_server(server, thread)

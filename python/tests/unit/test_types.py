@@ -64,7 +64,17 @@ class TypesTests(unittest.TestCase):
         )
         self.assertEqual(
             [item.name for item in fields(CommandInfo)],
-            ["pid", "command", "running"],
+            [
+                "pid",
+                "command",
+                "running",
+                "id",
+                "status",
+                "exit_code",
+                "created_at",
+                "started_at",
+                "finished_at",
+            ],
         )
         self.assertEqual(
             [item.name for item in fields(NodeInfo)],

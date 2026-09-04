@@ -2,7 +2,9 @@ import ipaddress
 import os
 import re
 from dataclasses import dataclass, field
-from typing import Any, Dict, Mapping, Optional, Sequence, Tuple, Union
+from datetime import datetime
+from enum import Enum
+from typing import Any, Callable, Dict, Mapping, Optional, Sequence, Tuple, Union
 
 import idna
 
@@ -58,6 +60,7 @@ class ConnectionConfig:
     gateway_address: Optional[str] = None
     gateway_use_tls: bool = False
     verify_tls: bool = False
+    token_provider: Optional[Callable[[], str]] = field(default=None, repr=False)
 
     def __post_init__(self) -> None:
         for field_name in ("server_address", "token"):
@@ -88,6 +91,15 @@ class ConnectionConfig:
         for field_name in ("use_tls", "gateway_use_tls", "verify_tls"):
             if not isinstance(getattr(self, field_name), bool):
                 raise TypeError(f"{field_name} must be a boolean")
+        if self.token_provider is not None and not callable(self.token_provider):
+            raise TypeError("token_provider must be callable")
+
+    def resolved_token(self) -> str:
+        """Return a fresh token when a provider is configured."""
+        token = self.token_provider() if self.token_provider is not None else self.token
+        if not isinstance(token, str) or not token.strip():
+            raise ValueError("token_provider must return a non-empty string")
+        return token.strip()
 
     @classmethod
     def from_env(
@@ -495,6 +507,34 @@ class PortForwarding:
 
 
 @dataclass(frozen=True)
+class DataPlaneSecurityPolicy:
+    """Per-sandbox client security for tunnel and port-forwarding.
+
+    Accepted values are ``"tls"`` and ``"tls-token"``. ``None`` inherits the
+    server deployment default. Direct access is always ``"tls-token"``.
+    """
+
+    tunnel_mode: Optional[str] = None
+    port_forward_mode: Optional[str] = None
+
+    def __post_init__(self) -> None:
+        for name, value in (
+            ("tunnel_mode", self.tunnel_mode),
+            ("port_forward_mode", self.port_forward_mode),
+        ):
+            if value is not None and value not in ("tls", "tls-token"):
+                raise ValueError(f"{name} must be 'tls', 'tls-token', or None")
+
+    def to_dict(self) -> Dict[str, str]:
+        result: Dict[str, str] = {}
+        if self.tunnel_mode is not None:
+            result["tunnelSecurityMode"] = self.tunnel_mode
+        if self.port_forward_mode is not None:
+            result["portForwardSecurityMode"] = self.port_forward_mode
+        return result
+
+
+@dataclass(frozen=True)
 class EntryInfo:
     name: str
     path: str
@@ -504,11 +544,26 @@ class EntryInfo:
     modified_time: float
 
 
+class CommandStatus(str, Enum):
+    PENDING = "PENDING"
+    RUNNING = "RUNNING"
+    SUCCEEDED = "SUCCEEDED"
+    FAILED = "FAILED"
+    TIMED_OUT = "TIMED_OUT"
+    KILLED = "KILLED"
+
+
 @dataclass(frozen=True)
 class CommandResult:
     stdout: str
     stderr: str
-    exit_code: int
+    exit_code: Optional[int]
+    status: CommandStatus = CommandStatus.SUCCEEDED
+    truncated: bool = False
+    error_code: Optional[str] = None
+    error_message: Optional[str] = None
+    stdout_truncated: bool = False
+    stderr_truncated: bool = False
 
 
 @dataclass(frozen=True)
@@ -649,6 +704,16 @@ class NodeInfo:
 
 @dataclass(frozen=True)
 class CommandInfo:
-    pid: int
+    pid: Optional[int]
     command: str
     running: bool
+    id: str = ""
+    status: CommandStatus = CommandStatus.RUNNING
+    exit_code: Optional[int] = None
+    created_at: Optional[datetime] = None
+    started_at: Optional[datetime] = None
+    finished_at: Optional[datetime] = None
+
+    @property
+    def command_id(self) -> str:
+        return self.id

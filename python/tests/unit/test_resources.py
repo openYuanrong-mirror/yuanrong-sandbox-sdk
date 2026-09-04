@@ -98,12 +98,11 @@ class ResourceTests(unittest.TestCase):
             client = SandboxClient(connection=connection)
             client.close()
 
-        acquire.assert_called_once_with(
-            "https",
-            "frontend.example:443",
-            False,
-            "secret",
-        )
+        acquire.assert_called_once()
+        scheme, server, verify_tls, token_provider = acquire.call_args.args
+        self.assertEqual((scheme, server, verify_tls), ("https", "frontend.example:443", False))
+        self.assertTrue(callable(token_provider))
+        self.assertEqual(token_provider(), "secret")
 
     def test_resources_accepts_explicit_connection_config(self):
         connection = ConnectionConfig(
