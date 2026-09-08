@@ -19,6 +19,7 @@ import random
 import time
 from typing import Dict, List, Optional, Union
 
+from ._http_pool import SandboxClientClosedError
 from ._transport import SandboxClient
 from .types import CommandInfo, CommandResult
 
@@ -26,6 +27,7 @@ logger = logging.getLogger(__name__)
 
 _POLL_THRESHOLD = 30  # seconds; above this, switch to start+poll
 _POLL_INTERVAL = 10  # seconds per poll call
+_POLL_RETRY_DELAY = 1  # seconds between failed poll calls
 
 
 def _poll_pid_until_done(
@@ -47,8 +49,14 @@ def _poll_pid_until_done(
                 {"pid": pid, "wait_timeout": poll_wait},
                 timeout=int(poll_wait),
             )
+        except SandboxClientClosedError:
+            raise
         except Exception as e:
             logger.warning("process.poll failed (pid=%d): %s", pid, e)
+            retry_delay = min(_POLL_RETRY_DELAY, deadline - time.monotonic())
+            if retry_delay <= 0:
+                break
+            time.sleep(retry_delay)
             continue
 
         status = poll["status"]
