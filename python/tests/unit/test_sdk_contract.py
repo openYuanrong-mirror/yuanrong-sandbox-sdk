@@ -6,6 +6,7 @@ from unittest.mock import patch
 import yr_sandbox
 from yr_sandbox import (
     ConnectionConfig,
+    DataPlaneSecurityPolicy,
     DNSPolicy,
     DNSRule,
     NetworkPolicy,
@@ -16,12 +17,21 @@ from yr_sandbox import (
     Sandbox,
     TrafficPolicy,
 )
-from yr_sandbox.commands import Commands
+from yr_sandbox.commands import (
+    CommandConflict,
+    CommandHandle,
+    CommandNotFound,
+    CommandSubmissionError,
+    Commands,
+)
+from yr_sandbox._transport import SandboxHTTPError
 from yr_sandbox.shell import Shells
+from yr_sandbox.shell.shell import Shell
 
 
 class _FakeClient:
     created = []
+    token = "sandbox-token"
 
     def __init__(self, *, connection=None):
         self.calls = []
@@ -38,6 +48,15 @@ class _FakeClient:
 
     def invoke(self, sandbox_id, action, args, **_kwargs):
         self.calls.append((sandbox_id, action, args))
+        if action == "process.capabilities":
+            return {
+                "protocol_version": 1,
+                "capabilities": [
+                    "stable-command-id",
+                    "recoverable-command-result",
+                    "multiplexed-command-watch",
+                ],
+            }
         if action == "process.exec":
             return {"stdout": "", "stderr": "", "exit_code": 0}
         if action == "process.list":
@@ -46,6 +65,30 @@ class _FakeClient:
                     {"pid": 7, "cmd": "sleep 1", "running": True},
                     {"pid": 8, "cmd": "true", "running": False},
                 ]
+            }
+        if action == "process.start":
+            return {
+                "command_id": args["command_id"],
+                "pid": 42,
+                "status": "running",
+                "error": None,
+            }
+        if action == "process.get":
+            return {
+                "command_id": args["command_id"],
+                "pid": 42,
+                "cmd": "sleep 1",
+                "status": "running",
+                "started_at_ms": 123,
+            }
+        if action == "process.wait":
+            return {
+                "command_id": args["command_id"],
+                "pid": 42,
+                "status": "finished",
+                "stdout": "done",
+                "stderr": "",
+                "exit_code": 0,
             }
         if action in ("shell.create", "shell.close"):
             return {}
@@ -174,6 +217,7 @@ class SDKContractTests(unittest.TestCase):
             token="secret",
             use_tls=True,
             gateway_address="gateway.example:8080",
+            gateway_use_tls=True,
         )
         with (
             patch("yr_sandbox.sandbox_api.SandboxClient", _FakeClient),
@@ -190,7 +234,7 @@ class SDKContractTests(unittest.TestCase):
         self.assertIs(sandbox.pty._connection_config, connection)
         self.assertEqual(
             sandbox.get_port_url(8080),
-            "http://gateway.example:8080/sandbox-1/8080",
+            "https://gateway.example:8080/sandbox-1/8080",
         )
 
     def test_sandbox_forwards_runtime_without_owning_runtime_registry(self):
@@ -264,6 +308,35 @@ class SDKContractTests(unittest.TestCase):
         self.assertNotIn("network", _FakeClient.created[-1])
         self.assertTrue(sandbox._client.direct_enabled)
         self.assertIsNone(inspect.signature(Sandbox).parameters["network"].default)
+
+    def test_data_plane_security_policy_is_scoped_to_create_request(self):
+        with patch("yr_sandbox.sandbox_api.SandboxClient", _FakeClient):
+            Sandbox(
+                image="ubuntu:22.04",
+                data_plane_security=DataPlaneSecurityPolicy(
+                    tunnel_mode="tls-token",
+                    port_forward_mode="tls",
+                ),
+                detached=True,
+            )
+
+        self.assertEqual(
+            _FakeClient.created[-1]["dataPlane"],
+            {
+                "tunnelSecurityMode": "tls-token",
+                "portForwardSecurityMode": "tls",
+            },
+        )
+
+    def test_empty_data_plane_security_policy_inherits_cluster_defaults(self):
+        with patch("yr_sandbox.sandbox_api.SandboxClient", _FakeClient):
+            Sandbox(
+                image="ubuntu:22.04",
+                data_plane_security=DataPlaneSecurityPolicy(),
+                detached=True,
+            )
+
+        self.assertNotIn("dataPlane", _FakeClient.created[-1])
 
     def test_block_network_uses_canonical_field_and_keeps_direct(self):
         with patch("yr_sandbox.sandbox_api.SandboxClient", _FakeClient):
@@ -625,6 +698,91 @@ class SDKContractTests(unittest.TestCase):
         self.assertTrue(processes[0].running)
         self.assertFalse(processes[1].running)
 
+    def test_background_command_has_stable_id_and_can_be_retrieved(self):
+        client = _FakeClient()
+        commands = Commands(client, "sandbox-1")
+        handle = commands.run("sleep 1", background=True)
+        self.assertIsInstance(handle, CommandHandle)
+        self.assertTrue(handle.id)
+        self.assertEqual(handle.pid, 42)
+        self.assertEqual(client.calls[-1][2]["command_id"], handle.id)
+
+        recovered = commands.get(handle.id)
+        self.assertEqual(recovered.id, handle.id)
+        self.assertEqual(recovered.pid, 42)
+        self.assertEqual(recovered.wait().stdout, "done")
+
+    def test_long_foreground_command_preserves_requested_remote_timeout(self):
+        client = _FakeClient()
+
+        result = Commands(client, "sandbox-1").run("sleep 31", timeout=31)
+
+        start = next(call for call in client.calls if call[1] == "process.start")
+        self.assertEqual(start[2]["timeout"], 31)
+        self.assertEqual(result.stdout, "done")
+
+    def test_submission_unknown_preserves_recoverable_command_id(self):
+        class _FailingClient(_FakeClient):
+            def invoke(self, sandbox_id, action, args, **kwargs):
+                if action == "process.start":
+                    raise TimeoutError("response lost")
+                return super().invoke(sandbox_id, action, args, **kwargs)
+
+        with self.assertRaises(CommandSubmissionError) as caught:
+            Commands(_FailingClient(), "sandbox-1").run("true", background=True)
+        self.assertTrue(caught.exception.command_id)
+        self.assertTrue(caught.exception.may_have_started)
+
+    def test_command_errors_preserve_request_and_resource_identity(self):
+        class _ConflictResult(dict):
+            request_id = "request-conflict"
+
+        class _ConflictClient(_FakeClient):
+            def invoke(self, sandbox_id, action, args, **kwargs):
+                if action == "process.start":
+                    return _ConflictResult(
+                        error="same id has a different request",
+                        error_code="COMMAND_CONFLICT",
+                    )
+                return super().invoke(sandbox_id, action, args, **kwargs)
+
+        with self.assertRaises(CommandConflict) as conflict:
+            Commands(_ConflictClient(), "sandbox-1").run(
+                "true", background=True, command_id="stable-id"
+            )
+        self.assertEqual(conflict.exception.sandbox_id, "sandbox-1")
+        self.assertEqual(conflict.exception.command_id, "stable-id")
+        self.assertEqual(conflict.exception.request_id, "request-conflict")
+
+        class _MissingClient(_FakeClient):
+            def invoke(self, sandbox_id, action, args, **kwargs):
+                if action == "process.get":
+                    raise SandboxHTTPError(
+                        404,
+                        {"error": "missing"},
+                        "missing",
+                        request_id="request-missing",
+                    )
+                return super().invoke(sandbox_id, action, args, **kwargs)
+
+        with self.assertRaises(CommandNotFound) as missing:
+            Commands(_MissingClient(), "sandbox-1").get("missing-id")
+        self.assertEqual(missing.exception.sandbox_id, "sandbox-1")
+        self.assertEqual(missing.exception.command_id, "missing-id")
+        self.assertEqual(missing.exception.request_id, "request-missing")
+
+    def test_sandbox_from_id_does_not_create_or_delete_remote(self):
+        with patch("yr_sandbox.sandbox_api.SandboxClient", _FakeClient):
+            sandbox = Sandbox.from_id("sandbox-existing")
+            self.assertEqual(sandbox.id, "sandbox-existing")
+            self.assertEqual(_FakeClient.created, [])
+            sandbox.close()
+            self.assertTrue(sandbox._client.closed)
+
+    def test_ambiguous_connect_aliases_are_not_exposed(self):
+        self.assertFalse(hasattr(Sandbox, "connect"))
+        self.assertFalse(hasattr(Commands, "connect"))
+
     def test_shell_uses_sandbox_default_cwd(self):
         client = _FakeClient()
         shells = Shells(client, "sandbox-1", default_cwd="/workspace")
@@ -760,6 +918,28 @@ class SDKContractTests(unittest.TestCase):
 
         self.assertEqual(_FakeClient.created[-1]["ports"], ["8080", "9090"])
 
+    def test_port_forward_url_tls_and_optional_auth_header_are_explicit(self):
+        with (
+            patch("yr_sandbox.sandbox_api.SandboxClient", _FakeClient),
+            patch.dict(
+                "os.environ",
+                {"YR_GATEWAY_ADDRESS": "edge.example:443", "YR_GATEWAY_TLS": "1"},
+            ),
+        ):
+            sandbox = Sandbox(
+                image="ubuntu:22.04",
+                port_forwardings=[8080],
+                detached=True,
+            )
+            self.assertEqual(
+                sandbox.get_port_url(8080),
+                "https://edge.example:443/sandbox-1/8080",
+            )
+            self.assertEqual(
+                sandbox.get_port_auth_headers(),
+                {"Authorization": "Bearer sandbox-token"},
+            )
+
     def test_duplicate_forwarded_ports_across_descriptor_and_integer_are_rejected(self):
         with patch("yr_sandbox.sandbox_api.SandboxClient", _FakeClient):
             with self.assertRaisesRegex(ValueError, "duplicate"):
@@ -807,6 +987,16 @@ class SDKContractTests(unittest.TestCase):
                     upstream="127.0.0.1:9000",
                 )
         self.assertEqual(_FakeClient.created, [])
+
+    def test_shell_clean_output_preserves_output_without_trailing_newline(self):
+        raw = "printf $SDK_E2E\r\nstateful__RRT_PROMPT__ echo __RRT_DONE_$?__\r\n"
+
+        self.assertEqual(Shell._clean_output(raw), "stateful")
+
+    def test_shell_clean_output_removes_reserved_prompt_after_newline(self):
+        raw = "pwd\r\n/tmp\r\n__RRT_PROMPT__ echo __RRT_DONE_$?__\r\n"
+
+        self.assertEqual(Shell._clean_output(raw), "/tmp")
 
 
 if __name__ == "__main__":

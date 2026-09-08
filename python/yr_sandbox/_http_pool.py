@@ -6,7 +6,8 @@ import os
 import threading
 from collections.abc import Mapping
 from dataclasses import dataclass
-from typing import Any
+from typing import Any, Callable, Union
+from urllib.parse import urlsplit
 
 import httpx
 
@@ -97,7 +98,7 @@ class _SharedHTTPClientRegistry:
         scheme: str,
         server: str,
         verify_tls: bool,
-        token: str,
+        token: Union[str, Callable[[], str]],
     ) -> "_SharedHTTPClientLease":
         target = (scheme, server, verify_tls)
         pid, client = self._acquire_target(target)
@@ -170,7 +171,7 @@ class _SharedHTTPClientLease:
         target: _TargetKey,
         pid: int,
         client: httpx.Client,
-        token: str,
+        token: Union[str, Callable[[], str]],
     ) -> None:
         self._registry = registry
         self._target = target
@@ -193,11 +194,11 @@ class _SharedHTTPClientLease:
         return self.request("DELETE", url, **kwargs)
 
     def request(self, method: str, url: str, **kwargs: Any) -> httpx.Response:
-        kwargs["headers"] = self._request_headers(kwargs.get("headers"))
+        kwargs["headers"] = self._request_headers(url, kwargs.get("headers"))
         return self._current_client().request(method, url, **kwargs)
 
     def stream(self, method: str, url: str, **kwargs: Any):
-        kwargs["headers"] = self._request_headers(kwargs.get("headers"))
+        kwargs["headers"] = self._request_headers(url, kwargs.get("headers"))
         return self._current_client().stream(method, url, **kwargs)
 
     def close(self) -> None:
@@ -217,9 +218,19 @@ class _SharedHTTPClientLease:
                 self._pid, self._client = self._registry._acquire_target(self._target)
             return self._client
 
-    def _request_headers(self, headers: Mapping[str, str] | None) -> httpx.Headers:
+    def _request_headers(
+        self, url: str, headers: Mapping[str, str] | None
+    ) -> httpx.Headers:
         request_headers = httpx.Headers(headers)
-        request_headers["X-Auth"] = self._token
+        token = self._token() if callable(self._token) else self._token
+        if not isinstance(token, str) or not token.strip():
+            raise ValueError("token provider must return a non-empty string")
+        token = token.strip()
+        if urlsplit(url).path.startswith("/direct/"):
+            request_headers.pop("X-Auth", None)
+            request_headers["Authorization"] = f"Bearer {token}"
+        else:
+            request_headers["X-Auth"] = token
         return request_headers
 
 
@@ -235,7 +246,7 @@ def acquire_shared_http_client(
     scheme: str,
     server: str,
     verify_tls: bool,
-    token: str,
+    token: Union[str, Callable[[], str]],
 ) -> _SharedHTTPClientLease:
     """Acquire a token-scoped lease for a process-local HTTP connection pool."""
     return _SHARED_HTTP_CLIENT_REGISTRY.acquire(scheme, server, verify_tls, token)

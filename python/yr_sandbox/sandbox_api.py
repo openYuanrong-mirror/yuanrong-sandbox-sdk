@@ -21,6 +21,7 @@ from .shell import Shells
 from .types import (
     YR_GET_DEFAULT_TIMEOUT,
     ConnectionConfig,
+    DataPlaneSecurityPolicy,
     Mount,
     NetworkPolicy,
     PauseResult,
@@ -338,6 +339,7 @@ class Sandbox:
         storage_mb: Optional[int] = None,
         storage_limit_mb: int = 0,
         network: Optional[NetworkPolicy] = None,
+        data_plane_security: Optional[DataPlaneSecurityPolicy] = None,
         create_timeout: Optional[int] = None,
         connection: Optional[ConnectionConfig] = None,
         extra_config: Optional[Dict[str, Any]] = None,
@@ -392,6 +394,9 @@ class Sandbox:
                 unrestricted network access.
             connection: Explicit frontend and gateway connection settings.
                 Omitting it reads the existing ``YR_*`` environment variables.
+            data_plane_security: Optional per-sandbox ``tls`` or ``tls-token``
+                policy for tunnel and port-forwarding. Unset fields inherit
+                server defaults.
             extra_config: Extra sandbox-side configuration forwarded to sandboxd.
         """
         if image is not None and (
@@ -458,6 +463,10 @@ class Sandbox:
             raise TypeError("network must be a NetworkPolicy or None")
         if connection is not None and not isinstance(connection, ConnectionConfig):
             raise TypeError("connection must be a ConnectionConfig or None")
+        if data_plane_security is not None and not isinstance(
+            data_plane_security, DataPlaneSecurityPolicy
+        ):
+            raise TypeError("data_plane_security must be a DataPlaneSecurityPolicy or None")
         if mounts is None:
             mount_list: List[Mount] = []
         else:
@@ -591,6 +600,8 @@ class Sandbox:
             body["mounts"] = [mount.to_dict() for mount in mount_list]
         if network is not None and not network.is_empty:
             body["network"] = network.to_dict()
+        if data_plane_security is not None and data_plane_security.to_dict():
+            body["dataPlane"] = data_plane_security.to_dict()
         if extra_config:
             body["extra_config"] = dict(extra_config)
         if detached:
@@ -723,6 +734,53 @@ class Sandbox:
             self._closed = True
             raise
 
+    @classmethod
+    def from_id(
+        cls,
+        sandbox_id: str,
+        *,
+        connection: Optional[ConnectionConfig] = None,
+    ) -> "Sandbox":
+        """Reconstruct a local handle for an existing sandbox by ID.
+
+        The returned object owns only its local clients. ``close()`` never
+        deletes the remote sandbox; use :meth:`delete` for explicit teardown.
+        """
+        if not isinstance(sandbox_id, str) or not sandbox_id.strip():
+            raise ValueError("sandbox_id must be a non-empty string")
+        if connection is not None and not isinstance(connection, ConnectionConfig):
+            raise TypeError("connection must be a ConnectionConfig or None")
+
+        client = SandboxClient() if connection is None else SandboxClient(connection=connection)
+        try:
+            info = client.instance_info(sandbox_id)
+            if str(info.get("status", "")).lower() != "running":
+                raise RuntimeError(
+                    f"sandbox {sandbox_id} is not running: {info.get('status', 'unknown')}"
+                )
+            sandbox = cls.__new__(cls)
+            sandbox._sid = sandbox_id
+            sandbox._client = client
+            sandbox._connection = connection
+            sandbox._detached = True
+            sandbox._closed = False
+            sandbox._image = info.get("image")
+            sandbox._cpu = info.get("required_cpu")
+            sandbox._memory = info.get("required_mem")
+            sandbox._cwd = None
+            sandbox._forwarded_ports = set()
+            sandbox._tunnel_client = None
+            sandbox._tunnel_url = ""
+            sandbox._upstream = None
+            sandbox._files = Filesystem(client, sandbox_id)
+            sandbox._commands = Commands(client, sandbox_id)
+            sandbox._shells = Shells(client, sandbox_id)
+            sandbox._pty = Pty(sandbox_id, connection=connection)
+            return sandbox
+        except Exception:
+            client.close()
+            raise
+
     # ── sub-resources ──────────────────────────────────────────────────
 
     @property
@@ -755,7 +813,8 @@ class Sandbox:
     def get_port_url(self, port: int) -> str:
         """Return the external URL to reach a forwarded port.
 
-        URL format: ``http://{gateway}/{sandbox_id}/{port}``.
+        URL format: ``http(s)://{gateway}/{sandbox_id}/{port}``. TLS is
+        selected from the sandbox's resolved gateway connection settings.
         """
         if port not in self._forwarded_ports:
             raise ValueError(
@@ -763,17 +822,32 @@ class Sandbox:
             )
         connection = getattr(self, "_connection", None)
         gateway = _gateway_address(connection)
+        safe_id = self._client._safe_id(self._sid)
         if connection is not None:
             tls = _gateway_uses_tls(connection)
         elif os.environ.get("YR_GATEWAY_ADDRESS", "").strip():
-            tls_setting = os.environ.get("YR_GATEWAY_TLS", "0")
-            tls = tls_setting.strip().lower() not in ("0", "false", "no")
+            tls = os.environ.get("YR_GATEWAY_TLS", "0").strip().lower() in (
+                "1",
+                "true",
+                "yes",
+            )
         else:
-            tls_setting = os.environ.get("YR_TLS", "1")
-            tls = tls_setting.strip().lower() not in ("0", "false", "no")
+            tls = os.environ.get("YR_TLS", "1").strip().lower() in (
+                "1",
+                "true",
+                "yes",
+            )
         scheme = "https" if tls else "http"
-        safe_id = self._client._safe_id(self._sid)
         return f"{scheme}://{gateway}/{safe_id}/{port}"
+
+    def get_port_auth_headers(self) -> Dict[str, str]:
+        """Return the optional gateway authentication header for a port URL.
+
+        Deployments with anonymous port-forwarding can omit this header. When
+        the gateway policy requires authentication, or when callers want tenant
+        binding in optional mode, pass the returned mapping to the HTTP client.
+        """
+        return {"Authorization": f"Bearer {self._client.token}"}
 
     # ── reverse tunnel ──────────────────────────────────────────────────
 

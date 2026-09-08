@@ -48,3 +48,28 @@ A future reliable mode should add manifest-based directory copy:
 Keep tar as the default for small directories; use manifest mode only when the
 caller asks for reliability or the directory is large enough to justify the
 extra metadata and per-file scheduling overhead.
+
+### 4. Native PyO3/Hyper transport
+
+In a separate SDK performance workstream, evaluate a small optional Rust
+transport exposed through PyO3 and built on Hyper/H2/Rustls. Keep the public
+Python SDK API and request-id semantics unchanged, and retain HTTPX as the
+default and compatibility fallback while the native path is developed.
+
+The native transport must provide:
+
+- process-local, fork-safe connection pools with bounded connections and idle
+  eviction;
+- HTTP/2 multiplexing for direct invoke and streaming upload/download;
+- explicit connect, pool-acquire, read, write, and overall deadline errors so
+  callers can distinguish a request that was not sent from an unknown outcome;
+- custom CA, mTLS, development-only insecure TLS, proxy bypass, cancellation,
+  and sync/async bindings;
+- response/header/body limits, metrics, and SDK-visible error mapping;
+- wheel builds for every Python, architecture, glibc, and musl target supported
+  by the sandbox SDK.
+
+Before making it the default, run the full SDK example suite and compare
+correctness, latency, throughput, connection count, and CPU usage against
+HTTPX on standalone and multi-node CCE. Keep these results separate from the
+raw Edge data-plane acceptance benchmark.

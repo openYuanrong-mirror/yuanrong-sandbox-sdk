@@ -62,9 +62,9 @@ variables. Omitting it preserves the environment-based behavior below.
 
 | Setting | Meaning |
 | --- | --- |
-| `YR_SERVER_ADDRESS` | Frontend gateway `host:port`. Used for lifecycle, invoke, and `/direct` file IO. |
-| `YR_TOKEN` | JWT sent as raw `X-Auth: <token>` on authenticated frontend routes. Do not use `Authorization: Bearer`. |
-| `YR_TLS` | `1/true/yes` selects `https://` for frontend routes; `0/false/no` selects plaintext HTTP. |
+| `YR_SERVER_ADDRESS` | Primary service entry `host:port`. Used for lifecycle and required `/direct` traffic. |
+| `YR_TOKEN` | JWT used for authenticated service routes. |
+| `YR_TLS` | `1/true/yes` selects `https://` for primary service routes; `0/false/no` selects plaintext HTTP. |
 | `YR_GATEWAY_ADDRESS` | Optional gateway/router `host:port` for reverse tunnel and user port URLs; falls back to `YR_SERVER_ADDRESS`. |
 | `YR_GATEWAY_TLS` | `1/true/yes` selects `wss://` for `/tunnel` and `https://` for user port URLs; default is plaintext. |
 
@@ -81,8 +81,11 @@ Base path: `/api/sandbox/v1/sandboxes` on `YR_SERVER_ADDRESS`.
 `CreateV1Request` fields used by SDKs include `name`, `namespace`, `tenant`,
 `runtime`, `image`/`rootfs`, `ports`, `idleTimeoutSeconds`,
 `createTimeoutSeconds`, `scheduleTimeoutSeconds`, `cpu`, `memory`,
-`cpu_limit`, `mem_limit`, `storage_limit_mb`, `env`, `mounts`, `extra_config`, and
-`tunnel`.
+`cpu_limit`, `mem_limit`, `storage_limit_mb`, `env`, `mounts`, `extra_config`,
+`tunnel`, and the
+optional per-sandbox `dataPlane` security policy. Python exposes the latter as
+`DataPlaneSecurityPolicy`; `tls` and `tls-token` are supported, unset fields
+inherit the server defaults, and `/direct` remains fixed to `tls-token`.
 Frontend owns internal RRT port environment injection (`RRT_HTTP_PORT`,
 `RRT_TUNNEL_WS_PORT`, `RRT_TUNNEL_HTTP_PORT`); SDK callers should request
 features declaratively instead of setting those ports.

@@ -1,136 +1,348 @@
-"""Command execution helpers for sandbox v1.
+"""Recoverable command execution for sandbox v1.
 
-Commands map to the RRT ``process.*`` actions:
-
-    process.exec        -> {stdout, stderr, exit_code}
-    process.start       -> {pid, error}   (``stdin=True`` opt-in)
-    process.poll        -> {status, stdout, stderr, exit_code}
-    process.wait        -> {stdout, stderr, exit_code}
-    process.kill        -> {killed, error}
-    process.send_stdin  -> {error}
-
-Long timeouts use a start+poll loop so individual HTTP calls stay short and
-survive gateway idle-connection resets. Real-time stdout streaming is not
-exposed yet; invoke-based stdin/background execution is supported.
+The public identity is ``command_id``.  A pid is exposed for diagnostics only
+and is never required to recover a handle after the SDK process restarts.
 """
 
+import asyncio
 import logging
 import random
+import re
 import time
+import uuid
+from datetime import datetime, timezone
 from typing import Dict, List, Optional, Union
 
-from ._transport import SandboxClient
-from .types import CommandInfo, CommandResult
+from ._transport import SandboxClient, SandboxHTTPError
+from ._command_metrics import increment, observe_wait
+from .types import CommandInfo, CommandResult, CommandStatus
 
 logger = logging.getLogger(__name__)
 
-_POLL_THRESHOLD = 30  # seconds; above this, switch to start+poll
-_POLL_INTERVAL = 10  # seconds per poll call
+_POLL_THRESHOLD = 30
+_POLL_INTERVAL = 10
+_COMMAND_ID = re.compile(r"^[A-Za-z0-9._:-]{1,128}$")
 
 
-def _poll_pid_until_done(
-    client: SandboxClient, sid: str, pid: int, timeout: int
-) -> CommandResult:
-    """Poll a running pid until it finishes or the wall-clock deadline expires."""
-    deadline = time.monotonic() + timeout
-    while True:
-        remaining = deadline - time.monotonic()
-        if remaining <= 0:
-            break
+class CommandSubmissionError(RuntimeError):
+    """Submission outcome is unknown, but the stable ID remains recoverable."""
 
-        jittered = _POLL_INTERVAL * (0.7 + random.random() * 0.6)  # noqa: S311 — poll jitter, not crypto
-        poll_wait = min(jittered, remaining)
-        try:
-            poll = client.invoke(
-                sid,
-                "process.poll",
-                {"pid": pid, "wait_timeout": poll_wait},
-                timeout=int(poll_wait),
-            )
-        except Exception as e:
-            logger.warning("process.poll failed (pid=%d): %s", pid, e)
-            continue
+    def __init__(
+        self,
+        message: str,
+        command_id: str,
+        may_have_started: bool,
+        *,
+        sandbox_id: str = "",
+        request_id: Optional[str] = None,
+    ):
+        super().__init__(message)
+        self.command_id = command_id
+        self.may_have_started = may_have_started
+        self.sandbox_id = sandbox_id
+        self.request_id = request_id
 
-        status = poll["status"]
-        if status == "done":
-            return CommandResult(
-                stdout=poll["stdout"],
-                stderr=poll["stderr"],
-                exit_code=poll["exit_code"],
-            )
-        if status == "error":
-            return CommandResult(
-                stdout="", stderr=poll.get("error", "Unknown error"), exit_code=-1
-            )
-        # status == "running" → loop
 
-    try:
-        client.invoke(sid, "process.kill", {"pid": pid})
-    except Exception as e:
-        logger.warning("process.kill after timeout failed (pid=%d): %s", pid, e)
+class CommandNotFound(LookupError):
+    def __init__(
+        self,
+        message: str,
+        *,
+        sandbox_id: str = "",
+        command_id: str = "",
+        request_id: Optional[str] = None,
+    ):
+        super().__init__(message)
+        self.sandbox_id = sandbox_id
+        self.command_id = command_id
+        self.request_id = request_id
+
+
+class CommandConflict(RuntimeError):
+    def __init__(
+        self,
+        message: str,
+        *,
+        sandbox_id: str = "",
+        command_id: str = "",
+        request_id: Optional[str] = None,
+    ):
+        super().__init__(message)
+        self.sandbox_id = sandbox_id
+        self.command_id = command_id
+        self.request_id = request_id
+
+
+class CommandExpired(CommandNotFound):
+    pass
+
+
+class CommandWaitTimeout(TimeoutError):
+    def __init__(self, sandbox_id: str, command_id: str, timeout: Optional[float]):
+        super().__init__(f"command {command_id} did not finish within {timeout} seconds")
+        self.sandbox_id = sandbox_id
+        self.command_id = command_id
+        self.timeout = timeout
+
+
+class CommandUnavailable(RuntimeError):
+    def __init__(
+        self,
+        message: str,
+        *,
+        sandbox_id: str = "",
+        command_id: str = "",
+        request_id: Optional[str] = None,
+    ):
+        super().__init__(message)
+        self.sandbox_id = sandbox_id
+        self.command_id = command_id
+        self.request_id = request_id
+
+
+class UnsupportedFeature(RuntimeError):
+    def __init__(
+        self,
+        message: str,
+        *,
+        sandbox_id: str = "",
+        command_id: str = "",
+        request_id: Optional[str] = None,
+    ):
+        super().__init__(message)
+        self.sandbox_id = sandbox_id
+        self.command_id = command_id
+        self.request_id = request_id
+
+
+class ResourceExhausted(RuntimeError):
+    def __init__(
+        self,
+        message: str,
+        *,
+        sandbox_id: str = "",
+        command_id: str = "",
+        request_id: Optional[str] = None,
+    ):
+        super().__init__(message)
+        self.sandbox_id = sandbox_id
+        self.command_id = command_id
+        self.request_id = request_id
+
+
+def _validate_command_id(command_id: str) -> str:
+    if not isinstance(command_id, str) or _COMMAND_ID.fullmatch(command_id) is None:
+        raise ValueError(
+            "command_id must contain 1..128 ASCII letters, digits, '.', '_', ':', or '-'"
+        )
+    return command_id
+
+
+def _result(snapshot: dict) -> CommandResult:
+    raw_status = snapshot.get("status")
+    if raw_status is None:
+        raw_status = "SUCCEEDED" if int(snapshot.get("exit_code", -1)) == 0 else "FAILED"
+    status_text = str(raw_status).upper()
+    if status_text in ("DONE", "FINISHED"):
+        status_text = "SUCCEEDED" if int(snapshot.get("exit_code", 0)) == 0 else "FAILED"
+    status = CommandStatus(status_text)
+    stdout_truncated = bool(snapshot.get("stdout_truncated", False))
+    stderr_truncated = bool(snapshot.get("stderr_truncated", False))
+    exit_code = snapshot.get("exit_code")
     return CommandResult(
-        stdout="", stderr=f"Command timed out after {timeout} seconds", exit_code=-1
+        stdout=str(snapshot.get("stdout", "")),
+        stderr=str(snapshot.get("stderr", "")),
+        exit_code=int(exit_code) if exit_code is not None else None,
+        status=status,
+        truncated=bool(snapshot.get("truncated", stdout_truncated or stderr_truncated)),
+        error_code=snapshot.get("error_code"),
+        error_message=snapshot.get("error_message"),
+        stdout_truncated=stdout_truncated,
+        stderr_truncated=stderr_truncated,
+    )
+
+
+def _info(snapshot: dict) -> CommandInfo:
+    if "status" in snapshot:
+        status_text = str(snapshot["status"]).upper()
+    else:
+        status_text = "RUNNING" if bool(snapshot.get("running", False)) else "SUCCEEDED"
+    if status_text == "DONE":
+        status_text = "SUCCEEDED" if int(snapshot.get("exit_code", 0)) == 0 else "FAILED"
+    status = CommandStatus(status_text)
+    finished_at = snapshot.get("finished_at_ms")
+    created_at = snapshot.get("created_at_ms")
+    started_at = snapshot.get("started_at_ms")
+    pid = snapshot.get("pid")
+    return CommandInfo(
+        pid=int(pid) if pid not in (None, -1) else None,
+        command=str(snapshot.get("cmd", "")),
+        running=status in (CommandStatus.PENDING, CommandStatus.RUNNING),
+        id=str(snapshot.get("command_id", "")),
+        status=status,
+        exit_code=int(snapshot["exit_code"]) if snapshot.get("exit_code") is not None else None,
+        created_at=datetime.fromtimestamp(int(created_at) / 1000, timezone.utc) if created_at is not None else None,
+        started_at=datetime.fromtimestamp(int(started_at) / 1000, timezone.utc) if started_at is not None else None,
+        finished_at=datetime.fromtimestamp(int(finished_at) / 1000, timezone.utc) if finished_at is not None else None,
     )
 
 
 class CommandHandle:
-    """Handle for a background process running in the sandbox."""
+    """A recoverable reference to one command in one sandbox."""
 
-    def __init__(self, pid: int, client: SandboxClient, sandbox_id: str):
+    def __init__(
+        self,
+        command_id: str,
+        client: SandboxClient,
+        sandbox_id: str,
+        pid: int = 0,
+    ):
+        self.command_id = _validate_command_id(command_id)
         self.pid = pid
         self._client = client
         self._sid = sandbox_id
 
-    def wait(self, timeout: Optional[int] = None) -> CommandResult:
-        if timeout is None:
-            result = self._client.invoke(
-                self._sid,
-                "process.wait",
-                {"pid": self.pid, "timeout": None},
-                timeout=-1,
+    @property
+    def id(self) -> str:
+        return self.command_id
+
+    @property
+    def sandbox_id(self) -> str:
+        return self._sid
+
+    def _snapshot(self) -> CommandInfo:
+        return _info(self._raw_snapshot())
+
+    def _raw_snapshot(self) -> dict:
+        try:
+            snapshot = self._client.invoke(
+                self._sid, "process.get", {"command_id": self.command_id}
             )
-            return CommandResult(
-                stdout=result["stdout"],
-                stderr=result["stderr"],
-                exit_code=result["exit_code"],
+        except SandboxHTTPError as error:
+            if error.status_code == 404:
+                raise CommandNotFound(
+                    str(error.payload.get("error", error)),
+                    sandbox_id=self._sid,
+                    command_id=self.command_id,
+                    request_id=error.request_id,
+                ) from error
+            raise
+        status = str(snapshot.get("status", "")).upper()
+        if status in ("NOT_FOUND", "EXPIRED"):
+            error_type = CommandExpired if status == "EXPIRED" else CommandNotFound
+            raise error_type(
+                snapshot.get("error", f"command {self.command_id} not found"),
+                sandbox_id=self._sid,
+                command_id=self.command_id,
+                request_id=getattr(snapshot, "request_id", None),
             )
-        return _poll_pid_until_done(self._client, self._sid, self.pid, timeout)
+        info = _info(snapshot)
+        if info.pid:
+            self.pid = info.pid
+        return snapshot
+
+    def poll(self) -> CommandStatus:
+        return self._snapshot().status
+
+    def wait(self, timeout: Optional[float] = None) -> CommandResult:
+        increment("command_wait_total")
+        started = time.monotonic()
+        try:
+            snapshot = self._raw_snapshot()
+            if str(snapshot.get("status", "")).upper() in ("PENDING", "RUNNING"):
+                connection = getattr(self._client, "_connection", None)
+                if connection is None:
+                    snapshot = self._client.invoke(
+                        self._sid,
+                        "process.wait",
+                        {"command_id": self.command_id, "timeout": timeout},
+                        timeout=-1 if timeout is None else max(1, int(timeout) + 1),
+                    )
+                else:
+                    from ._command_watch import manager_for
+
+                    manager_for(connection).wait(self._sid, self.command_id, timeout)
+                    snapshot = self._raw_snapshot()
+            return _result(snapshot)
+        finally:
+            observe_wait(time.monotonic() - started)
+
+    async def wait_async(self, timeout: Optional[float] = None) -> CommandResult:
+        """Wait without blocking the caller's event loop.
+
+        The shared command watch transport can wake this wait; the authoritative
+        terminal result is always fetched through ``process.wait/get``.
+        """
+        connection = getattr(self._client, "_connection", None)
+        if connection is None:
+            return await asyncio.to_thread(self.wait, timeout)
+
+        increment("command_wait_total")
+        started = time.monotonic()
+        try:
+            snapshot = await asyncio.to_thread(self._raw_snapshot)
+            if str(snapshot.get("status", "")).upper() in ("PENDING", "RUNNING"):
+                from ._command_watch import manager_for
+
+                await manager_for(connection).wait_async(
+                    self._sid, self.command_id, timeout
+                )
+                snapshot = await asyncio.to_thread(self._raw_snapshot)
+            return _result(snapshot)
+        finally:
+            observe_wait(time.monotonic() - started)
 
     def kill(self) -> bool:
-        return self._client.invoke(self._sid, "process.kill", {"pid": self.pid})[
-            "killed"
-        ]
+        return bool(
+            self._client.invoke(
+                self._sid, "process.kill", {"command_id": self.command_id}
+            )["killed"]
+        )
 
     def send_stdin(self, data: str, eof: bool = False) -> None:
-        """Write *data* to the process's stdin (RRT ``cmd_send_stdin``).
-
-        The background process must have been started with ``stdin=True``.
-        ``eof=True`` closes stdin so the child sees EOF on its next read.
-        """
-        result = self._client.invoke(
+        response = self._client.invoke(
             self._sid,
             "process.send_stdin",
-            {"pid": self.pid, "data": data, "eof": eof},
+            {"command_id": self.command_id, "data": data, "eof": eof},
         )
-        if result.get("error"):
-            raise RuntimeError(f"Failed to send stdin: {result['error']}")
+        if response.get("error"):
+            raise RuntimeError(f"Failed to send stdin: {response['error']}")
 
     def close_stdin(self) -> None:
         self.send_stdin("", eof=True)
 
 
 class Commands:
-    """Client-side wrapper for command execution on the remote sandbox."""
+    """Command collection belonging to one sandbox."""
 
-    def __init__(
-        self,
-        client: SandboxClient,
-        sandbox_id: str,
-        default_cwd: Optional[str] = None,
-    ):
+    def __init__(self, client: SandboxClient, sandbox_id: str, default_cwd: Optional[str] = None):
         self._client = client
         self._sid = sandbox_id
         self._default_cwd = default_cwd
+        self._capabilities_checked = False
+
+    def _require_recovery_capability(self, command_id: str = "") -> None:
+        if self._capabilities_checked:
+            return
+        try:
+            response = self._client.invoke(self._sid, "process.capabilities", {})
+        except Exception as error:
+            raise UnsupportedFeature(
+                "sandbox runtime does not expose the recoverable command capability",
+                sandbox_id=self._sid,
+                command_id=command_id,
+                request_id=getattr(error, "request_id", None),
+            ) from error
+        capabilities = set(response.get("capabilities", ()))
+        required = {"stable-command-id", "recoverable-command-result", "multiplexed-command-watch"}
+        if response.get("protocol_version") != 1 or not required.issubset(capabilities):
+            raise UnsupportedFeature(
+                "sandbox runtime does not support command recovery protocol v1",
+                sandbox_id=self._sid,
+                command_id=command_id,
+                request_id=getattr(response, "request_id", None),
+            )
+        self._capabilities_checked = True
 
     def run(
         self,
@@ -140,98 +352,142 @@ class Commands:
         cwd: Optional[str] = None,
         timeout: int = 60,
         stdin: bool = False,
+        *,
+        command_id: Optional[str] = None,
     ) -> Union[CommandResult, CommandHandle]:
-        """Execute *cmd* on the sandbox.
-
-        ``background=True`` returns a :class:`CommandHandle`. ``stdin=True``
-        (only with ``background=True``) keeps an open stdin PIPE so
-        ``send_stdin`` can feed the process; otherwise stdin is /dev/null.
-        """
         if stdin and not background:
             raise ValueError("stdin is only supported when background=True")
         effective_cwd = cwd if cwd is not None else self._default_cwd
-
         if background:
-            result = self._client.invoke(
-                self._sid,
-                "process.start",
-                {
-                    "cmd": cmd,
-                    "envs": envs,
-                    "cwd": effective_cwd,
-                    "want_stdin": stdin,
-                },
-            )
-            if result.get("error"):
-                raise RuntimeError(f"Failed to start command: {result['error']}")
-            return CommandHandle(result["pid"], self._client, self._sid)
-
-        if timeout > _POLL_THRESHOLD:
-            return self._run_with_poll(
-                cmd, envs=envs, cwd=effective_cwd, timeout=timeout
-            )
-
-        result = self._client.invoke(
-            self._sid,
-            "process.exec",
-            {
-                "cmd": cmd,
+            increment("command_submit_total")
+            stable_id = _validate_command_id(command_id or f"cmd-{uuid.uuid4()}")
+            self._require_recovery_capability(stable_id)
+            request = {
+                "command_id": stable_id,
+                "command": cmd,
                 "envs": envs,
                 "cwd": effective_cwd,
+                "want_stdin": stdin,
                 "timeout": timeout,
-            },
+            }
+            try:
+                response = self._client.invoke(self._sid, "process.start", request)
+            except SandboxHTTPError as error:
+                if error.status_code == 409:
+                    raise CommandConflict(
+                        str(error.payload.get("error", error)),
+                        sandbox_id=self._sid,
+                        command_id=stable_id,
+                        request_id=error.request_id,
+                    ) from error
+                if error.status_code in (429, 503):
+                    raise ResourceExhausted(
+                        str(error.payload.get("error", error)),
+                        sandbox_id=self._sid,
+                        command_id=stable_id,
+                        request_id=error.request_id,
+                    ) from error
+                if error.status_code == 501:
+                    raise UnsupportedFeature(
+                        str(error.payload.get("error", error)),
+                        sandbox_id=self._sid,
+                        command_id=stable_id,
+                        request_id=error.request_id,
+                    ) from error
+                raise RuntimeError(str(error.payload.get("error", error))) from error
+            except Exception as error:
+                raise CommandSubmissionError(
+                    f"command submission outcome is unknown: {error}",
+                    command_id=stable_id,
+                    may_have_started=True,
+                    sandbox_id=self._sid,
+                    request_id=getattr(error, "request_id", None),
+                ) from error
+            if response.get("error"):
+                error_code = str(response.get("error_code", ""))
+                if error_code == "COMMAND_CONFLICT":
+                    raise CommandConflict(
+                        str(response["error"]),
+                        sandbox_id=self._sid,
+                        command_id=stable_id,
+                        request_id=getattr(response, "request_id", None),
+                    )
+                if error_code == "RESOURCE_EXHAUSTED":
+                    raise ResourceExhausted(
+                        str(response["error"]),
+                        sandbox_id=self._sid,
+                        command_id=stable_id,
+                        request_id=getattr(response, "request_id", None),
+                    )
+                raise RuntimeError(f"Failed to start command: {response['error']}")
+            return CommandHandle(stable_id, self._client, self._sid, int(response.get("pid", 0)))
+
+        if timeout > _POLL_THRESHOLD:
+            return self._run_with_poll(cmd, envs, effective_cwd, timeout)
+        response = self._client.invoke(
+            self._sid,
+            "process.exec",
+            {"cmd": cmd, "envs": envs, "cwd": effective_cwd, "timeout": timeout},
             timeout=timeout,
         )
-        return CommandResult(
-            stdout=result["stdout"],
-            stderr=result["stderr"],
-            exit_code=result["exit_code"],
-        )
+        return _result(response)
 
     def _run_with_poll(
-        self,
-        cmd: str,
-        envs: Optional[Dict[str, str]] = None,
-        cwd: Optional[str] = None,
-        timeout: int = 60,
+        self, cmd: str, envs: Optional[Dict[str, str]], cwd: Optional[str], timeout: int
     ) -> CommandResult:
-        result = self._client.invoke(
-            self._sid, "process.start", {"cmd": cmd, "envs": envs, "cwd": cwd}
+        handle = self.run(
+            cmd,
+            background=True,
+            envs=envs,
+            cwd=cwd,
+            timeout=timeout,
         )
-        if result.get("error"):
-            raise RuntimeError(f"Failed to start command: {result['error']}")
-        return _poll_pid_until_done(self._client, self._sid, result["pid"], timeout)
+        assert isinstance(handle, CommandHandle)
+        deadline = time.monotonic() + timeout
+        while True:
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                handle.kill()
+                return CommandResult(
+                    "",
+                    f"Command timed out after {timeout} seconds",
+                    None,
+                    status=CommandStatus.TIMED_OUT,
+                )
+            wait = min(_POLL_INTERVAL * (0.7 + random.random() * 0.6), remaining)
+            try:
+                return handle.wait(wait)
+            except TimeoutError:
+                continue
+            except Exception as error:
+                logger.warning("command wait failed (command_id=%s): %s", handle.id, error)
+
+    def get(self, command_id: str) -> CommandHandle:
+        """Read an existing RRT command record and return its handle."""
+        increment("command_get_total")
+        stable_id = _validate_command_id(command_id)
+        self._require_recovery_capability(stable_id)
+        handle = CommandHandle(stable_id, self._client, self._sid)
+        handle._snapshot()
+        return handle
 
     def list(self) -> List[CommandInfo]:
         processes = self._client.invoke(self._sid, "process.list", {}).get("processes")
         if not isinstance(processes, list):
             return []
-        out: List[CommandInfo] = []
-        for item in processes:
-            if not isinstance(item, dict):
-                continue
-            running = item.get("running")
-            if not isinstance(running, bool):
-                running = item.get("status") == "running"
-            out.append(
-                CommandInfo(
-                    pid=int(item.get("pid", 0)),
-                    command=str(item.get("cmd", "")),
-                    running=running,
-                )
-            )
-        return out
+        return [_info(item) for item in processes if isinstance(item, dict)]
 
-    def kill(self, pid: int) -> bool:
-        return self._client.invoke(self._sid, "process.kill", {"pid": pid})["killed"]
+    def kill(self, command: Union[str, int]) -> bool:
+        key = {"command_id": command} if isinstance(command, str) else {"pid": command}
+        return bool(self._client.invoke(self._sid, "process.kill", key)["killed"])
 
-    def send_stdin(self, pid: int, data: str, eof: bool = False) -> None:
-        """Write *data* to the stdin of process *pid* (RRT ``cmd_send_stdin``)."""
-        result = self._client.invoke(
-            self._sid, "process.send_stdin", {"pid": pid, "data": data, "eof": eof}
+    def send_stdin(self, command: Union[str, int], data: str, eof: bool = False) -> None:
+        key = {"command_id": command} if isinstance(command, str) else {"pid": command}
+        response = self._client.invoke(
+            self._sid, "process.send_stdin", {**key, "data": data, "eof": eof}
         )
-        if result.get("error"):
-            raise RuntimeError(f"Failed to send stdin: {result['error']}")
+        if response.get("error"):
+            raise RuntimeError(f"Failed to send stdin: {response['error']}")
 
-    def close_stdin(self, pid: int) -> None:
-        self.send_stdin(pid, "", eof=True)
+    def close_stdin(self, command: Union[str, int]) -> None:
+        self.send_stdin(command, "", eof=True)

@@ -4,7 +4,7 @@ from urllib.parse import parse_qs, urlparse
 
 from yr_sandbox import ConnectionConfig
 from yr_sandbox._pty_transport import _build_pty_uri
-from yr_sandbox.pty import Pty, _use_tls
+from yr_sandbox.pty import Pty, _pty_server, _use_tls
 
 
 class PtyTests(unittest.TestCase):
@@ -64,9 +64,22 @@ class PtyTests(unittest.TestCase):
 
         parsed = urlparse(seen["uri"])
         self.assertEqual(parsed.scheme, "wss")
-        self.assertEqual(parsed.netloc, "gateway.example:8443")
+        self.assertEqual(parsed.netloc, "frontend.example:443")
         self.assertEqual(parse_qs(parsed.query)["token"], ["secret"])
 
+    def test_server_address_is_preferred_over_gateway(self):
+        with patch.dict(
+            "os.environ",
+            {
+                "YR_SERVER_ADDRESS": "frontend:8888",
+                "YR_GATEWAY_ADDRESS": "edge:8080",
+                "YR_TLS": "0",
+                "YR_GATEWAY_TLS": "1",
+            },
+            clear=True,
+        ):
+            self.assertEqual(_pty_server(), "frontend:8888")
+            self.assertFalse(_use_tls())
 
 if __name__ == "__main__":
     unittest.main()

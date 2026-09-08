@@ -110,15 +110,25 @@ class Shell:
     # Clean it here so callers receive command output only.
     # TODO(rrt): ideally RRT's bash_poll should strip this server-side.
     _ANSI_RE = re.compile(r"\x1b(?:[@-Z\\-_]|\[[0-?]*[ -/]*[@-~])")
+    _RRT_PROMPT = "__RRT_PROMPT__ "
 
     @classmethod
     def _clean_output(cls, raw: str) -> str:
         text = cls._ANSI_RE.sub("", raw)
         text = text.replace("\r\n", "\n").replace("\r", "\n")
         lines = text.split("\n")
-        # Drop the leading command echo (first line) and any line carrying the
-        # sentinel (which also covers the trailing ``prompt# echo __RRT_DONE_``).
-        body = [ln for ln in lines[1:] if "__RRT_DONE_" not in ln]
+        # Drop the leading command echo. RRT reserves a deterministic prompt
+        # marker so output without a trailing newline can be retained while
+        # the prompt and sentinel command are removed.
+        body = []
+        for line in lines[1:]:
+            if cls._RRT_PROMPT in line:
+                output, _prompt = line.split(cls._RRT_PROMPT, 1)
+                if output:
+                    body.append(output)
+                continue
+            if "__RRT_DONE_" not in line:
+                body.append(line)
         return "\n".join(body).strip("\n")
 
     @staticmethod
