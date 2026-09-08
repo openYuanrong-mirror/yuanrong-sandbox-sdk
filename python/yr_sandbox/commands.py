@@ -13,6 +13,7 @@ import uuid
 from datetime import datetime, timezone
 from typing import Dict, List, Optional, Union
 
+from ._http_pool import SandboxClientClosedError
 from ._transport import SandboxClient, SandboxHTTPError
 from ._command_metrics import increment, observe_wait
 from .types import CommandInfo, CommandResult, CommandStatus
@@ -21,6 +22,7 @@ logger = logging.getLogger(__name__)
 
 _POLL_THRESHOLD = 30
 _POLL_INTERVAL = 10
+_POLL_RETRY_DELAY = 1  # seconds between failed wait calls
 _COMMAND_ID = re.compile(r"^[A-Za-z0-9._:-]{1,128}$")
 
 
@@ -457,10 +459,15 @@ class Commands:
             wait = min(_POLL_INTERVAL * (0.7 + random.random() * 0.6), remaining)
             try:
                 return handle.wait(wait)
+            except SandboxClientClosedError:
+                raise
             except TimeoutError:
                 continue
             except Exception as error:
                 logger.warning("command wait failed (command_id=%s): %s", handle.id, error)
+                retry_delay = min(_POLL_RETRY_DELAY, deadline - time.monotonic())
+                if retry_delay > 0:
+                    time.sleep(retry_delay)
 
     def get(self, command_id: str) -> CommandHandle:
         """Read an existing RRT command record and return its handle."""
