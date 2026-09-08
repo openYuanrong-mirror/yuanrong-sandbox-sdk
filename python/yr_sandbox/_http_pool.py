@@ -15,6 +15,10 @@ _DEFAULT_MAX_KEEPALIVE_CONNECTIONS = 128
 _DEFAULT_KEEPALIVE_EXPIRY = 30.0
 
 
+class SandboxClientClosedError(RuntimeError):
+    """Raised when a request uses a closed SandboxClient lease."""
+
+
 class _RejectAllCookiesPolicy(http.cookiejar.DefaultCookiePolicy):
     """Prevent a shared client from persisting response cookies."""
 
@@ -211,7 +215,9 @@ class _SharedHTTPClientLease:
     def _current_client(self) -> httpx.Client:
         with self._lock:
             if self._closed:
-                raise RuntimeError("Cannot send a request after SandboxClient.close()")
+                raise SandboxClientClosedError(
+                    "Cannot send a request after SandboxClient.close()"
+                )
             current_pid = os.getpid()
             if current_pid != self._pid:
                 self._pid, self._client = self._registry._acquire_target(self._target)
