@@ -15,7 +15,8 @@ from these environment variables::
 
 Response format:
 - Frontend control requests use the existing raw ``X-Auth`` contract.
-- Direct-route requests use standard ``Authorization: Bearer <JWT>``.
+- Direct-route requests include ``Authorization: Bearer <JWT>`` and the
+  same raw ``X-Auth`` token for compatibility with existing Frontend deployments.
 - Frontend responses use ``{"code", "message", "data"}``; ``data`` is a
   base64-encoded JSON result and is decoded by this client.
 """

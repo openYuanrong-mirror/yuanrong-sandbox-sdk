@@ -937,7 +937,7 @@ class SDKContractTests(unittest.TestCase):
             )
             self.assertEqual(
                 sandbox.get_port_auth_headers(),
-                {"Authorization": "Bearer sandbox-token"},
+                {"Authorization": "Bearer sandbox-token", "X-Auth": "sandbox-token"},
             )
 
     def test_duplicate_forwarded_ports_across_descriptor_and_integer_are_rejected(self):

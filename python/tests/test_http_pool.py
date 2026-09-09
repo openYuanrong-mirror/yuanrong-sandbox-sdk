@@ -47,8 +47,8 @@ class _EchoServer(ThreadingHTTPServer):
     daemon_threads = True
     block_on_close = False
 
-    def __init__(self, *, tls_context=None):
-        super().__init__(("127.0.0.1", 0), _EchoHandler)
+    def __init__(self, *, tls_context=None, handler=_EchoHandler):
+        super().__init__(("127.0.0.1", 0), handler)
         self.client_ports = set()
         self.connection_lock = threading.Lock()
         if tls_context is not None:
@@ -150,7 +150,7 @@ def test_put_uses_shared_client_and_request_token(monkeypatch):
         _stop_server(server, thread)
 
 
-def test_control_and_data_plane_use_separate_auth_headers(monkeypatch):
+def test_direct_preserves_legacy_auth_alongside_bearer_auth(monkeypatch):
     server, thread = _start_server()
     address = f"127.0.0.1:{server.server_port}"
     client = _new_client(monkeypatch, address, "sandbox-token")
@@ -160,7 +160,7 @@ def test_control_and_data_plane_use_separate_auth_headers(monkeypatch):
 
         assert control["token"] == "sandbox-token"
         assert control["authorization"] is None
-        assert direct["token"] is None
+        assert direct["token"] == "sandbox-token"
         assert direct["authorization"] == "Bearer sandbox-token"
     finally:
         client.close()
@@ -186,7 +186,7 @@ def test_token_provider_is_resolved_for_every_http_request(monkeypatch):
         ).json()
 
         assert first["token"] == "token-a"
-        assert second["token"] is None
+        assert second["token"] == "token-b"
         assert second["authorization"] == "Bearer token-b"
     finally:
         client.close()
@@ -331,5 +331,35 @@ def test_fork_replaces_inherited_pool_and_socket(monkeypatch):
         assert child["keys"][0][0] == child_pid
     finally:
         os.close(read_fd)
+        client.close()
+        _stop_server(server, thread)
+
+
+@pytest.mark.parametrize("auth_header", ["X-Auth", "Authorization"])
+def test_direct_requests_work_with_legacy_and_edge_auth_servers(monkeypatch, auth_header):
+    class AuthHandler(_EchoHandler):
+        def do_GET(self):
+            expected = "sandbox-token" if auth_header == "X-Auth" else "Bearer sandbox-token"
+            if self.headers.get(auth_header) != expected:
+                self.send_response(401)
+                self.send_header("Content-Length", "0")
+                self.end_headers()
+                return
+            super().do_GET()
+
+    server = _EchoServer(handler=AuthHandler)
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    address = f"127.0.0.1:{server.server_port}"
+    client = _new_client(monkeypatch, address, "sandbox-token")
+    url = f"http://{address}/direct/sandbox/50090"
+    stale = {"X-Auth": "stale", "Authorization": "Bearer stale"}
+    try:
+        response = client._http.get(url, headers=stale, timeout=5)
+        assert response.status_code == 200
+        with client._http.stream("GET", url, headers=stale, timeout=5) as response:
+            assert response.status_code == 200
+            response.read()
+    finally:
         client.close()
         _stop_server(server, thread)

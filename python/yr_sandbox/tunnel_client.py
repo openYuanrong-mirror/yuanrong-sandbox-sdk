@@ -377,6 +377,7 @@ class TunnelClient:
                 connect_url = tunnel_ws_url
                 if self._token:
                     _extra_headers["Authorization"] = f"Bearer {self._token}"
+                    _extra_headers["X-Auth"] = self._token
                     # Keep credentials out of gateway access logs by default.
                     # Operators that sit behind a gateway known to drop custom
                     # WebSocket headers can explicitly enable the query-token

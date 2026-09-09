@@ -176,9 +176,10 @@ class _CommandWaitManager:
             if scheme == "wss" and not self._connection.verify_tls:
                 ssl_context = ssl._create_unverified_context()  # noqa: SLF001
             try:
+                token = self._connection.resolved_token()
                 async with ws_client.connect(
                     uri,
-                    additional_headers={"Authorization": f"Bearer {self._connection.resolved_token()}"},
+                    additional_headers={"Authorization": f"Bearer {token}", "X-Auth": token},
                     ssl=ssl_context,
                     ping_interval=20,
                     ping_timeout=10,

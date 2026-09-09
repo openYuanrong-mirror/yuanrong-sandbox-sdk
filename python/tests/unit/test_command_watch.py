@@ -48,3 +48,27 @@ def test_async_wait_cancellation_only_removes_local_subscription():
             assert manager._desired() == set()
 
     asyncio.run(scenario())
+
+
+def test_command_watch_preserves_legacy_frontend_auth():
+    async def scenario():
+        manager = _manager()
+        captured = {}
+
+        def connect(_uri, **kwargs):
+            captured.update(kwargs)
+            raise asyncio.CancelledError
+
+        with (
+            patch.object(manager, "_desired", return_value={("sandbox", "command")}),
+            patch("websockets.asyncio.client.connect", side_effect=connect),
+        ):
+            try:
+                await manager._run()
+            except asyncio.CancelledError:
+                pass
+        assert captured["additional_headers"] == {
+            "Authorization": "Bearer token", "X-Auth": "token"
+        }
+
+    asyncio.run(scenario())

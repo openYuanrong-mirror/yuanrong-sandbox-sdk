@@ -232,11 +232,10 @@ class _SharedHTTPClientLease:
         if not isinstance(token, str) or not token.strip():
             raise ValueError("token provider must return a non-empty string")
         token = token.strip()
+        # Keep the legacy Frontend contract alongside Edge bearer authentication.
+        request_headers["X-Auth"] = token
         if urlsplit(url).path.startswith("/direct/"):
-            request_headers.pop("X-Auth", None)
             request_headers["Authorization"] = f"Bearer {token}"
-        else:
-            request_headers["X-Auth"] = token
         return request_headers
 
 

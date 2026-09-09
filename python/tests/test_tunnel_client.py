@@ -977,8 +977,8 @@ class TunnelClientTlsTests(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(reconnect_logs)
         self.assertTrue(all(record.levelno < logging.WARNING for record in reconnect_logs))
 
-    async def test_wss_uses_default_certificate_and_hostname_verification(self):
-        client = TunnelClient(upstream="127.0.0.1:1")
+    async def test_wss_preserves_legacy_auth_and_default_tls_verification(self):
+        client = TunnelClient(upstream="127.0.0.1:1", token="sandbox-token")
         captured = {}
 
         class _FailingConnection:
@@ -1000,6 +1000,10 @@ class TunnelClientTlsTests(unittest.IsolatedAsyncioTestCase):
         ):
             await client._connect_loop("wss://tunnel.example.test/path")
 
+        self.assertEqual(
+            captured["additional_headers"],
+            {"Authorization": "Bearer sandbox-token", "X-Auth": "sandbox-token"},
+        )
         context = captured["ssl"]
         self.assertIsInstance(context, ssl.SSLContext)
         self.assertTrue(context.check_hostname)

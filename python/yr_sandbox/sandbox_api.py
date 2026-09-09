@@ -841,13 +841,14 @@ class Sandbox:
         return f"{scheme}://{gateway}/{safe_id}/{port}"
 
     def get_port_auth_headers(self) -> Dict[str, str]:
-        """Return the optional gateway authentication header for a port URL.
+        """Return gateway authentication headers compatible with Frontend and Edge.
 
         Deployments with anonymous port-forwarding can omit this header. When
         the gateway policy requires authentication, or when callers want tenant
         binding in optional mode, pass the returned mapping to the HTTP client.
         """
-        return {"Authorization": f"Bearer {self._client.token}"}
+        token = self._client.token
+        return {"Authorization": f"Bearer {token}", "X-Auth": token}
 
     # ── reverse tunnel ──────────────────────────────────────────────────
 
