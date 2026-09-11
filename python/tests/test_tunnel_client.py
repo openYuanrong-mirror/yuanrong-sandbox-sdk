@@ -716,6 +716,61 @@ class TunnelClientRequestTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(headers.get("Cookie"), "caller=explicit")
 
 
+class TunnelClientRelayCleanupTests(unittest.IsolatedAsyncioTestCase):
+    async def _check_relay_cleanup(self, cancel_proxy):
+        async def upstream_handler(websocket):
+            await websocket.wait_closed()
+
+        async with serve(upstream_handler, "127.0.0.1", 0) as server:
+            port = server.sockets[0].getsockname()[1]
+            websocket = _FrameWebSocket()
+            websocket.feed(hello_frame())
+            websocket.feed({
+                "type": "ws_connect",
+                "id": "00112233-4455-6677-8899-aabbccddeeff",
+                "path": "/cleanup",
+                "headers": {},
+            })
+            client = TunnelClient(upstream=f"127.0.0.1:{port}")
+            proxy_task = asyncio.create_task(client._proxy_loop(websocket))
+            relays = set()
+            try:
+                connected = await asyncio.wait_for(websocket.sent.get(), timeout=2)
+                self.assertEqual(connected["type"], "ws_connected")
+                # Keep strong references so an orphan cannot disappear through GC
+                # before its lifecycle is checked.
+                relays = {
+                    task for task in asyncio.all_tasks()
+                    if task.get_coro().__qualname__.endswith((
+                        "handle_ws_connect.<locals>.from_upstream",
+                        "handle_ws_connect.<locals>.from_sandbox",
+                    ))
+                }
+                self.assertEqual(len(relays), 2)
+                if cancel_proxy:
+                    proxy_task.cancel()
+                    with self.assertRaises(asyncio.CancelledError):
+                        await asyncio.wait_for(proxy_task, timeout=2)
+                else:
+                    websocket.close_input()
+                    await asyncio.wait_for(proxy_task, timeout=2)
+                self.assertTrue(
+                    all(task.done() for task in relays),
+                    "outer tunnel ended with a live WebSocket relay task",
+                )
+            finally:
+                proxy_task.cancel()
+                for task in relays:
+                    task.cancel()
+                await asyncio.gather(proxy_task, *relays, return_exceptions=True)
+
+    async def test_outer_eof_joins_websocket_relays(self):
+        await self._check_relay_cleanup(cancel_proxy=False)
+
+    async def test_proxy_cancellation_joins_websocket_relays(self):
+        await self._check_relay_cleanup(cancel_proxy=True)
+
+
 class TunnelClientHeartbeatTests(unittest.IsolatedAsyncioTestCase):
     async def test_sends_application_ping_and_accepts_matching_pong(self):
         websocket = _FrameWebSocket()

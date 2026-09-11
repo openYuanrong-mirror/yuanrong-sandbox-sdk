@@ -1164,14 +1164,17 @@ class TunnelClient:
 
                     upstream_task = asyncio.create_task(from_upstream())
                     sandbox_task = asyncio.create_task(from_sandbox())
-                    done, pending = await asyncio.wait(
-                        (upstream_task, sandbox_task),
-                        return_when=asyncio.FIRST_COMPLETED,
-                    )
-                    for task in pending:
-                        task.cancel()
-                    if pending:
-                        await asyncio.gather(*pending, return_exceptions=True)
+                    relay_tasks = (upstream_task, sandbox_task)
+                    try:
+                        done, _ = await asyncio.wait(
+                            relay_tasks,
+                            return_when=asyncio.FIRST_COMPLETED,
+                        )
+                    finally:
+                        for task in relay_tasks:
+                            if not task.done():
+                                task.cancel()
+                        await asyncio.gather(*relay_tasks, return_exceptions=True)
                     for task in done:
                         task.result()
 
