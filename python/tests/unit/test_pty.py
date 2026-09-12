@@ -1,3 +1,4 @@
+import ssl
 import unittest
 from unittest.mock import patch
 from urllib.parse import parse_qs, urlparse
@@ -8,6 +9,30 @@ from yr_sandbox.pty import Pty, _pty_server, _use_tls
 
 
 class PtyTests(unittest.TestCase):
+    def test_explicit_tls_verification_applies_to_pty_transport(self):
+        for use_tls, verify_tls, expected in (
+            (True, True, ssl.CERT_REQUIRED),
+            (True, False, ssl.CERT_NONE),
+            (False, True, None),
+        ):
+            with self.subTest(use_tls=use_tls, verify_tls=verify_tls):
+                config = ConnectionConfig(
+                    server_address="frontend.example:443",
+                    token="test",
+                    use_tls=use_tls,
+                    verify_tls=verify_tls,
+                )
+                with patch("yr_sandbox.pty._PtyConnection") as connection:
+                    factory = Pty("sandbox-1", connection=config)
+                    session = factory.create("echo ok")
+                    context = connection.call_args.kwargs["ssl_context"]
+                    if expected is None:
+                        self.assertIsNone(context)
+                    else:
+                        self.assertEqual(context.verify_mode, expected)
+                        self.assertEqual(context.check_hostname, verify_tls)
+                    session.close()
+
     def test_uri_preserves_command_protocol(self):
         uri = _build_pty_uri(
             server="frontend.example:443",

@@ -72,13 +72,16 @@ def _pty_server() -> str:
     )
 
 
-def _ssl_context(use_tls: bool) -> ssl.SSLContext | None:
+def _ssl_context(use_tls: bool, verify_tls: bool = False) -> ssl.SSLContext | None:
     if not use_tls:
         return None
-    context = ssl.SSLContext(ssl.PROTOCOL_TLS_CLIENT)
+    if verify_tls:
+        context = ssl.create_default_context()
+    else:
+        context = ssl.SSLContext(ssl.PROTOCOL_TLS_CLIENT)
+        context.check_hostname = False
+        context.verify_mode = ssl.CERT_NONE
     context.minimum_version = ssl.TLSVersion.TLSv1_2
-    context.check_hostname = False
-    context.verify_mode = ssl.CERT_NONE
     return context
 
 
@@ -216,7 +219,10 @@ class Pty:
 
         transport = _PtyConnection(
             uri,
-            ssl_context=_ssl_context(use_tls),
+            ssl_context=_ssl_context(
+                use_tls,
+                self._connection_config.verify_tls if self._connection_config else False,
+            ),
             rows=rows,
             cols=cols,
             on_data=on_data,

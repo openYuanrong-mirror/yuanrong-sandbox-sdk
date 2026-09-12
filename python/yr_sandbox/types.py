@@ -51,7 +51,7 @@ class ConnectionConfig:
     ``gateway_address`` selects tunnel, user-port, and PTY routes and falls back
     to ``server_address`` when omitted. ``gateway_use_tls`` selects WSS for the
     reverse tunnel and for PTY when a separate gateway is configured.
-    ``verify_tls`` controls frontend HTTP certificate verification.
+    ``verify_tls`` controls frontend HTTP and WebSocket certificate verification.
     """
 
     server_address: str
