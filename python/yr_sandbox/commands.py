@@ -352,11 +352,16 @@ class Commands:
         background: bool = False,
         envs: Optional[Dict[str, str]] = None,
         cwd: Optional[str] = None,
-        timeout: int = 60,
+        timeout: Optional[int] = None,
         stdin: bool = False,
         *,
         command_id: Optional[str] = None,
     ) -> Union[CommandResult, CommandHandle]:
+        """Run a command, with a default 60-second foreground deadline.
+
+        Background commands have no execution deadline unless ``timeout`` is
+        supplied explicitly.
+        """
         if stdin and not background:
             raise ValueError("stdin is only supported when background=True")
         effective_cwd = cwd if cwd is not None else self._default_cwd
@@ -370,8 +375,9 @@ class Commands:
                 "envs": envs,
                 "cwd": effective_cwd,
                 "want_stdin": stdin,
-                "timeout": timeout,
             }
+            if timeout is not None:
+                request["timeout"] = timeout
             try:
                 response = self._client.invoke(self._sid, "process.start", request)
             except SandboxHTTPError as error:
@@ -424,6 +430,7 @@ class Commands:
                 raise RuntimeError(f"Failed to start command: {response['error']}")
             return CommandHandle(stable_id, self._client, self._sid, int(response.get("pid", 0)))
 
+        timeout = 60 if timeout is None else timeout
         if timeout > _POLL_THRESHOLD:
             return self._run_with_poll(cmd, envs, effective_cwd, timeout)
         response = self._client.invoke(
@@ -449,7 +456,14 @@ class Commands:
         while True:
             remaining = deadline - time.monotonic()
             if remaining <= 0:
-                handle.kill()
+                try:
+                    handle.kill()
+                except SandboxHTTPError as error:
+                    if error.status_code != 400 or error.payload.get("error_code") != "COMMAND_NOT_RUNNING":
+                        raise
+                    # RRT may reach its execution deadline before the local
+                    # wait expires. Return that authoritative terminal result.
+                    return handle.wait(0)
                 return CommandResult(
                     "",
                     f"Command timed out after {timeout} seconds",

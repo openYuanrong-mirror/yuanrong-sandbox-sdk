@@ -455,6 +455,9 @@ See [`TODO.md`](TODO.md) for remaining SDK work.
 
 ## Recover a background command
 
+Background commands run without an execution deadline by default. Pass
+`timeout` to set one explicitly; foreground commands default to 60 seconds.
+
 The SDK process does not persist command handles. Generate a command ID and
 persist the `(sandbox_id, command_id)` pair in the caller's own database before
 submission, then bind fresh handles after a restart:

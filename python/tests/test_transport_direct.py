@@ -758,6 +758,47 @@ def test_direct_unknown_outcome_retry_exhaustion_does_not_fallback():
     print("ok: exhausted unknown-outcome retries do not fall back ->", calls)
 
 
+def test_direct_mixed_failures_preserve_unknown_outcome():
+    for first in ("read", "invalid-json", "gateway"):
+        for later in ("connect", "pool", "missing"):
+            calls = []
+
+            def handler(request):
+                body = json.loads(request.content)
+                calls.append((request.url.path, body["requestId"],
+                              request.headers["x-yr-request-id"]))
+                _check(request.url.path.startswith("/direct/"),
+                       f"unknown outcome crossed to RuntimeRPC: {calls}")
+                if len(calls) == 1:
+                    if first == "read":
+                        raise httpx.RemoteProtocolError("response lost", request=request)
+                    if first == "invalid-json":
+                        return httpx.Response(200, content=b"incomplete-json")
+                    return httpx.Response(502, text="upstream lost")
+                if later == "connect":
+                    raise httpx.ConnectError("connection refused", request=request)
+                if later == "pool":
+                    raise httpx.PoolTimeout("pool exhausted", request=request)
+                return httpx.Response(404)
+
+            client = _make_client(handler)
+            try:
+                with patch("yr_sandbox._transport.time.sleep"):
+                    try:
+                        client.invoke("sandbox-demo", "process.start", {"command": "append"})
+                    except SandboxError as error:
+                        _check("outcome is unknown" in str(error), str(error))
+                        _check(error.request_id == calls[0][1], "request id lost")
+                    else:
+                        raise AssertionError("mixed unknown outcome must fail")
+                _check(len(calls) == (2 if later == "missing" else 3), str(calls))
+                _check(len({call[1] for call in calls}) == 1, str(calls))
+                _check(all(call[1] == call[2] for call in calls), str(calls))
+                _check(not client._direct_disabled, "mixed failure disabled direct")
+            finally:
+                client.close()
+
+
 def test_direct_non_retryable_http_errors_do_not_fallback():
     for status in (400, 401, 403, 409, 429, 500):
         calls = []
@@ -1694,6 +1735,7 @@ if __name__ == "__main__":
     test_direct_503_retries_with_same_request_id()
     test_direct_read_timeout_retries_with_same_request_id()
     test_direct_unknown_outcome_retry_exhaustion_does_not_fallback()
+    test_direct_mixed_failures_preserve_unknown_outcome()
     test_direct_non_retryable_http_errors_do_not_fallback()
     test_direct_invalid_json_retries_with_same_request_id()
     test_direct_connect_error_falls_back()

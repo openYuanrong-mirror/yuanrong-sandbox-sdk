@@ -103,8 +103,10 @@ def _http_timeout_for_tunnel() -> httpx.Timeout:
     return httpx.Timeout(seconds)
 
 
-def _headers_for_rebuilt_request(headers):
-    """Return ordered second-hop headers from the tunnel pair-list."""
+def _header_pairs(headers):
+    """Decode legacy dictionaries and ordered header pairs."""
+    if isinstance(headers, dict):
+        headers = headers.items()
     pairs = []
     for item in headers or []:
         if not isinstance(item, (list, tuple)) or len(item) != 2:
@@ -113,7 +115,12 @@ def _headers_for_rebuilt_request(headers):
         if not isinstance(name, str) or not isinstance(value, str):
             raise TypeError("tunnel header names and values must be strings")
         pairs.append((name, value))
+    return pairs
 
+
+def _headers_for_rebuilt_request(headers):
+    """Return ordered second-hop headers after removing connection metadata."""
+    pairs = _header_pairs(headers)
     connection_tokens = {
         token.strip().lower()
         for name, value in pairs
@@ -629,7 +636,7 @@ class TunnelClient:
 
         def cleanup_completed() -> None:
             def cached_frame_bytes(frame: dict) -> int:
-                headers = frame.get("headers") or []
+                headers = _header_pairs(frame.get("headers"))
                 return len(frame.get("body", "")) + sum(
                     len(name) + len(value) for name, value in headers
                 )
@@ -676,7 +683,7 @@ class TunnelClient:
                 return False
             return True
 
-        def response_metadata(resp: httpx.Response):
+        def response_metadata(resp: httpx.Response, legacy_headers: bool = False):
             response_headers = [
                 (name.decode("ascii"), value.decode("latin-1"))
                 for name, value in resp.headers.raw
@@ -689,14 +696,15 @@ class TunnelClient:
                     except ValueError:
                         pass
                     break
-            return response_headers, content_length
+            return (dict(response_headers) if legacy_headers else response_headers), content_length
 
         async def send_streaming_response(
             rid: str,
             resp: httpx.Response,
             body_expected: bool,
+            legacy_headers: bool = False,
         ) -> None:
-            response_headers, content_length = response_metadata(resp)
+            response_headers, content_length = response_metadata(resp, legacy_headers)
             if (
                 body_expected
                 and content_length is not None
@@ -776,7 +784,8 @@ class TunnelClient:
                     headers=req_headers or None,
                     content=body,
                 ) as resp:
-                    response_headers, content_length = response_metadata(resp)
+                    legacy_headers = isinstance(frame.get("headers"), dict)
+                    response_headers, content_length = response_metadata(resp, legacy_headers)
                     response_body_limit = (
                         negotiated_max_body_size
                         if negotiated_protocol_version >= PROTOCOL_VERSION
@@ -795,7 +804,7 @@ class TunnelClient:
                             100 <= resp.status_code < 200
                             or resp.status_code in (204, 304)
                         )
-                        await send_streaming_response(rid, resp, body_expected)
+                        await send_streaming_response(rid, resp, body_expected, legacy_headers)
                         return None
                     raw_body = b"".join([chunk async for chunk in resp.aiter_raw()])
                     if len(raw_body) > response_body_limit:
@@ -858,7 +867,9 @@ class TunnelClient:
                     body_expected = method.upper() != "HEAD" and not (
                         100 <= resp.status_code < 200 or resp.status_code in (204, 304)
                     )
-                    await send_streaming_response(rid, resp, body_expected)
+                    await send_streaming_response(
+                        rid, resp, body_expected, isinstance(frame.get("headers"), dict)
+                    )
             except asyncio.CancelledError:
                 raise
             except Exception as exc:

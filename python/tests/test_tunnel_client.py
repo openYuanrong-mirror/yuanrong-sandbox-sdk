@@ -174,6 +174,36 @@ class TunnelClientRequestTests(unittest.IsolatedAsyncioTestCase):
             "application/octet-stream",
         )
 
+    async def test_legacy_headers_round_trip_and_cached_response(self):
+        frame = {
+            "type": "http_req", "id": "legacy-request", "method": "POST",
+            "path": "/headers", "headers": {
+                "Connection": "X-Local", "X-Local": "drop",
+                "Authorization": "Bearer legacy", "Content-Length": "999",
+            }, "body": base64.b64encode(b"legacy-body").decode("ascii"),
+        }
+        websocket = _FrameWebSocket()
+        client = TunnelClient(upstream=f"127.0.0.1:{self.server.server_port}")
+        task = asyncio.create_task(client._proxy_loop(websocket))
+        try:
+            websocket.feed(frame)
+            first = await asyncio.wait_for(websocket.sent.get(), timeout=2)
+            self.assertEqual(first["type"], "http_resp")
+            self.assertIsInstance(first["headers"], dict)
+            self.assertEqual(base64.b64decode(first["body"]), b"ok")
+            websocket.feed(frame)
+            cached = await asyncio.wait_for(websocket.sent.get(), timeout=2)
+            self.assertEqual(cached, first)
+            self.assertEqual(len(_RecordingHandler.requests), 1)
+            _, headers, body = _RecordingHandler.requests[0]
+            self.assertEqual(body, b"legacy-body")
+            self.assertEqual(headers["Authorization"], "Bearer legacy")
+            self.assertIsNone(headers.get("X-Local"))
+            self.assertEqual(headers["Content-Length"], str(len(body)))
+        finally:
+            websocket.close_input()
+            await asyncio.wait_for(task, timeout=2)
+
     async def test_v2_streams_request_and_response_with_binary_chunks(self):
         request_id = "00112233-4455-6677-8899-aabbccddeeff"
         payload = b"a" * 100_000

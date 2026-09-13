@@ -708,6 +708,7 @@ class SandboxClient:
         url = f"{self._direct_base}/{self._safe_id(sandbox_id)}/invoke"
         last_error: Optional[BaseException] = None
         last_failure_safe = False
+        outcome_unknown = False
         attempts = 0
 
         for attempt in range(1, _DIRECT_MAX_ATTEMPTS + 1):
@@ -743,6 +744,7 @@ class SandboxClient:
                 self._direct_route_misses = 0
                 last_error = exc
                 last_failure_safe = False
+                outcome_unknown = True
             except httpx.RequestError as exc:
                 self._direct_route_misses = 0
                 raise SandboxError(
@@ -752,6 +754,14 @@ class SandboxClient:
                 ) from exc
             else:
                 if resp.status_code == 404:
+                    if outcome_unknown:
+                        # An earlier attempt may already have executed. Route
+                        # disappearance does not make RuntimeRPC replay safe.
+                        last_error = SandboxError(
+                            "direct route disappeared after an unknown outcome",
+                            request_id=request_id,
+                        )
+                        break
                     self._direct_route_misses += 1
                     if (
                         self._direct_route_misses > _DIRECT_ROUTE_MISS_BUDGET
@@ -774,6 +784,7 @@ class SandboxClient:
                         f"HTTP {resp.status_code}: {resp.text}"
                     )
                     last_failure_safe = False
+                    outcome_unknown = True
                 elif resp.status_code >= 400:
                     try:
                         payload = resp.json()
@@ -797,6 +808,7 @@ class SandboxClient:
                             request_id=request_id,
                         )
                         last_failure_safe = False
+                        outcome_unknown = True
                     else:
                         if not isinstance(parsed, dict):
                             parsed = {"value": parsed}
@@ -821,8 +833,8 @@ class SandboxClient:
             )
             time.sleep(backoff)
 
-        if last_failure_safe and last_error is not None:
-            # No connection was established and no request bytes reached RRT.
+        if last_failure_safe and not outcome_unknown and last_error is not None:
+            # Every attempt failed before request bytes could reach RRT.
             self._direct_disabled = True
             return {}, True
         detail = last_error or "invoke deadline exhausted"
