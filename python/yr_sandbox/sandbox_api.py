@@ -9,7 +9,7 @@ import logging
 import os
 import random
 import re
-from collections.abc import Mapping
+from collections.abc import Mapping, Sequence
 from typing import Any, Dict, List, Optional, Tuple, Union
 from urllib.parse import urlparse
 
@@ -18,6 +18,7 @@ from .commands import Commands
 from .filesystem import Filesystem
 from .pty import Pty
 from .shell import Shells
+from .scheduling import ScheduleAffinity, _build_schedule_affinities
 from .types import (
     YR_GET_DEFAULT_TIMEOUT,
     ConnectionConfig,
@@ -37,10 +38,6 @@ DEFAULT_SCHEDULE_TIMEOUT = 30
 _INIT_CALL_TIMEOUT = 30
 CREATE_TIMEOUT_BUFFER = 30
 _CREATE_TIMEOUT_RESERVE = _INIT_CALL_TIMEOUT + CREATE_TIMEOUT_BUFFER
-_AFFINITY_KIND_RESOURCE = 0
-_AFFINITY_REQUIRED = 2
-_LABEL_OPERATION_IN = 0
-_NODE_ID_LABEL = "NODE_ID"
 _SUPPORTED_XPU_TYPES = frozenset({"gpu", "npu"})
 _SNAPSHOT_RESOURCE_FIELDS = frozenset(
     {"cpu", "memory", "cpu_limit", "mem_limit"}
@@ -331,6 +328,7 @@ class Sandbox:
         detached: bool = False,
         node_id: Optional[str] = None,
         *,
+        schedule_affinities: Optional[Sequence[ScheduleAffinity]] = None,
         snapshot_id: Optional[str] = None,
         failover: bool = False,
         inherit_entrypoint: bool = False,
@@ -349,7 +347,7 @@ class Sandbox:
             image: Container image to use (e.g. ``"python:3.12-slim"``).
             rootfs: S3-compatible EROFS root filesystem configuration.
             runtime: Sandbox isolation runtime identifier. Defaults to
-                ``runsc`` and is validated by the runtime layer.
+                ``runsc``. Fresh creates require a node advertising this runtime.
             cpu: CPU scheduling request in milli-cores (default 1000).
             memory: Memory scheduling request in MB (default 4096).
             cpu_limit: CPU cgroup limit in milli-cores (0 = same as *cpu*).
@@ -375,6 +373,10 @@ class Sandbox:
                 ``proxy_port - 1``. Defaults to 8766.
             tunnel_connect_timeout: Seconds to wait for the tunnel WebSocket.
             detached: If True, ``kill()`` / context-manager exit skips teardown.
+            node_id: Required node identity, intersected with resource affinities.
+            schedule_affinities: Label-based placement constraints and preferences.
+                Fresh creates intersect required resource groups with ``runtime``.
+                Snapshot placement can be constrained explicitly using these groups.
             xpu: Optional whole-device XPU request in ``type:model:count``
                 format. Leave ``model`` empty to accept any model. The first
                 version supports one ``gpu`` or ``npu`` request.
@@ -402,6 +404,9 @@ class Sandbox:
             raise TypeError("rootfs must be an S3Config")
         if image is not None and rootfs is not None:
             raise ValueError("image and rootfs are mutually exclusive")
+        if not isinstance(runtime, str) or not runtime.strip():
+            raise ValueError("runtime must be a non-empty string")
+        runtime = runtime.strip()
         if snapshot_id is not None and (
             not isinstance(snapshot_id, str) or not snapshot_id.strip()
         ):
@@ -436,8 +441,13 @@ class Sandbox:
         if node_id is not None:
             if not isinstance(node_id, str):
                 raise TypeError("node_id must be a string")
-            if not node_id:
+            if not node_id.strip():
                 raise ValueError("node_id cannot be empty string")
+        schedule_affinity_body = _build_schedule_affinities(
+            schedule_affinities,
+            runtime if snapshot_id is None else None,
+            node_id,
+        )
         _validate_xpu(xpu)
         if storage_mb is not None:
             if isinstance(storage_mb, bool) or not isinstance(storage_mb, int):
@@ -573,20 +583,8 @@ class Sandbox:
         body["storage_limit_mb"] = storage_limit_mb
         if env:
             body["env"] = dict(env)
-        if node_id:
-            body["scheduleAffinities"] = [
-                {
-                    "kind": _AFFINITY_KIND_RESOURCE,
-                    "affinity": _AFFINITY_REQUIRED,
-                    "labelOps": [
-                        {
-                            "type": _LABEL_OPERATION_IN,
-                            "labelKey": _NODE_ID_LABEL,
-                            "labelValues": [node_id],
-                        }
-                    ],
-                }
-            ]
+        if schedule_affinity_body:
+            body["scheduleAffinities"] = schedule_affinity_body
         if mount_list:
             body["mounts"] = [mount.to_dict() for mount in mount_list]
         if network is not None and not network.is_empty:

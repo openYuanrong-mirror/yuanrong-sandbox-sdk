@@ -16,6 +16,74 @@ with Sandbox(image="python:3.12-slim", cpu=2000, memory=4096) as sandbox:
 `close()` releases local SDK resources and leaves the remote sandbox alive.
 `kill()` deletes a non-detached remote sandbox as well.
 
+## Runtime and scheduling affinities
+
+Fresh creates automatically require the node label `sandbox.runtime` to contain
+the requested `runtime` (default `runsc`). For example, a pool with runsc-only
+ECS nodes and runc/firecracker-only bare-metal nodes schedules the default
+request to ECS. An incompatible pool fails scheduling within `schedule_timeout`.
+Runtime identifiers are extensible strings; the SDK does not maintain a registry.
+
+Use `schedule_affinities` for additional placement constraints or preferences:
+
+```python
+from yr_sandbox import LabelOperator, Sandbox, ScheduleAffinity
+
+with Sandbox(
+    cpu=1000,
+    memory=2048,
+    schedule_affinities=[
+        ScheduleAffinity([LabelOperator("zone", values=["malaysia-a"])]),
+        ScheduleAffinity(
+            [LabelOperator("disk", values=["ssd"])],
+            affinity="preferred",
+        ),
+    ],
+) as sandbox:
+    print(sandbox.id)
+```
+
+`ScheduleAffinity` accepts `kind="resource"` (default) or `"instance"`, and
+`affinity="required"` (default), `"preferred"`, `"required_anti"`, or
+`"preferred_anti"`. Resource rules match node labels; instance rules match
+instance labels using the scheduler's affinity behavior.
+
+| `LabelOperator.operator` | Meaning | `values` |
+| --- | --- | --- |
+| `in` (default) | Label contains any listed value | Non-empty sequence of strings |
+| `not_in` | Label contains none of the listed values, or key is absent | Non-empty sequence of strings |
+| `exists` | Key is present | Omit |
+| `not_exists` | Key is absent | Omit |
+
+Expressions within a group are ANDed. Ordinary required groups are also ANDed;
+required anti-affinity rejects the combined label match. Preferred groups affect
+scoring. Setting `preferred_priority=True` uses groups in order as alternatives;
+for anti-affinity each alternative negates its group match. On resource
+preferences, combining it with `preferred_anti_other_labels=True` requires one
+of those alternatives to match. Groups sharing the same effective selector must
+agree on `preferred_priority`; inconsistent configurations fail before sending
+a request.
+
+The SDK intersects runtime and any `node_id` constraint with every required
+resource alternative, including preferences promoted to required. User rules
+are preserved: conflicting constraints can leave no schedulable node. Config
+objects are immutable and reusable across creates; the SDK copies their payloads.
+
+For `Sandbox.create(snapshot_id, ...)` and `Sandbox(snapshot_id=...)`, the backend
+restores the runtime from the snapshot template. The snapshot query API does not
+expose that runtime, so the SDK preserves inheritance and adds no automatic
+runtime affinity on these paths. When its runtime is known, constrain placement
+explicitly, for example for a runc snapshot:
+
+```python
+clone = Sandbox.create(
+    "snapshot-id",
+    schedule_affinities=[
+        ScheduleAffinity([LabelOperator("sandbox.runtime", values=["runc"])])
+    ],
+)
+```
+
 ## Image startup process
 
 Set `inherit_entrypoint=True` on a fresh image-backed sandbox to start the

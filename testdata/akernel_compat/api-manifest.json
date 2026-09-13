@@ -1,6 +1,8 @@
 {
   "sdk": "sandbox-python",
   "exports": [
+    "LabelOperator",
+    "ScheduleAffinity",
     "Sandbox",
     "Shell",
     "Shells",
