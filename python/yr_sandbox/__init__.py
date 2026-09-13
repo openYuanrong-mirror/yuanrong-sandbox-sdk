@@ -1,3 +1,4 @@
+from .scheduling import LabelOperator, ScheduleAffinity
 from .types import (
     CommandInfo,
     CommandResult,
@@ -38,6 +39,8 @@ __all__ = [
     "PtyError",
     "SandboxError",
     # data types
+    "LabelOperator",
+    "ScheduleAffinity",
     "ConnectionConfig",
     "EntryInfo",
     "CommandResult",
