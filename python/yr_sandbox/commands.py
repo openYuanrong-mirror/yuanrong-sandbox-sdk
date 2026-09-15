@@ -13,8 +13,10 @@ import uuid
 from datetime import datetime, timezone
 from typing import Dict, List, Optional, Union
 
+import httpx
+
 from ._http_pool import SandboxClientClosedError
-from ._transport import SandboxClient, SandboxHTTPError
+from ._transport import SandboxClient, SandboxError, SandboxHTTPError
 from ._command_metrics import increment, observe_wait
 from .types import CommandInfo, CommandResult, CommandStatus
 
@@ -23,6 +25,8 @@ logger = logging.getLogger(__name__)
 _POLL_THRESHOLD = 30
 _POLL_INTERVAL = 10
 _POLL_RETRY_DELAY = 1  # seconds between failed wait calls
+_POLL_MAX_CONSECUTIVE_ERRORS = 3
+_POLL_NON_RETRYABLE_HTTP_STATUS = frozenset({400, 401, 403, 405, 410, 422})
 _COMMAND_ID = re.compile(r"^[A-Za-z0-9._:-]{1,128}$")
 
 
@@ -453,6 +457,7 @@ class Commands:
         )
         assert isinstance(handle, CommandHandle)
         deadline = time.monotonic() + timeout
+        consecutive_errors = 0
         while True:
             remaining = deadline - time.monotonic()
             if remaining <= 0:
@@ -476,12 +481,29 @@ class Commands:
             except SandboxClientClosedError:
                 raise
             except TimeoutError:
+                consecutive_errors = 0
                 continue
-            except Exception as error:
-                logger.warning("command wait failed (command_id=%s): %s", handle.id, error)
+            except (SandboxError, httpx.RequestError, CommandUnavailable) as error:
+                if isinstance(error, SandboxHTTPError) and (
+                    error.terminal or error.status_code in _POLL_NON_RETRYABLE_HTTP_STATUS
+                ):
+                    raise
+                consecutive_errors += 1
                 retry_delay = min(_POLL_RETRY_DELAY, deadline - time.monotonic())
-                if retry_delay > 0:
-                    time.sleep(retry_delay)
+                if retry_delay <= 0:
+                    continue
+                if consecutive_errors >= _POLL_MAX_CONSECUTIVE_ERRORS:
+                    raise CommandUnavailable(
+                        f"command wait failed after {consecutive_errors} consecutive errors: {error}",
+                        sandbox_id=self._sid,
+                        command_id=handle.id,
+                        request_id=getattr(error, "request_id", None),
+                    ) from error
+                logger.warning(
+                    "command wait failed (sandbox=%s, command_id=%s, attempt=%d/%d): %s",
+                    self._sid, handle.id, consecutive_errors, _POLL_MAX_CONSECUTIVE_ERRORS, error,
+                )
+                time.sleep(retry_delay)
 
     def get(self, command_id: str) -> CommandHandle:
         """Read an existing RRT command record and return its handle."""

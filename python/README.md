@@ -482,3 +482,14 @@ result = command.wait()
 context as a notification channel. The final result is always read back from
 RRT's authoritative command registry. A local wait timeout or client restart
 does not terminate the remote command.
+
+For foreground commands longer than 30 seconds, the SDK waits in bounded rounds.
+Responses with `code=SANDBOX_EXITED` or `SANDBOX_SCHEDULE_FAILED` and
+`retryable=false` end the wait immediately. `SandboxHTTPError` retains the HTTP
+status, response payload and request ID. `SANDBOX_RECOVERING` and transient
+request/watch errors allow at most three consecutive failed wait rounds, with
+a one-second delay between retries. A normal notification wait timeout resets
+this count and continues waiting within the command execution deadline.
+Invalid requests, authorization failures and missing command records stop the
+wait. On terminal rejection or exhausted retries, cleanup remains with the
+caller; normal execution deadline handling still attempts to kill the command.

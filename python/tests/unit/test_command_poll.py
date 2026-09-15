@@ -10,7 +10,7 @@ import pytest
 from yr_sandbox import _http_pool, commands
 from yr_sandbox._http_pool import SandboxClientClosedError
 from yr_sandbox._transport import SandboxClient, SandboxError, SandboxHTTPError
-from yr_sandbox.commands import CommandHandle, Commands
+from yr_sandbox.commands import CommandHandle, Commands, CommandUnavailable, CommandNotFound
 from yr_sandbox.types import CommandResult, CommandStatus
 
 
@@ -87,8 +87,7 @@ def test_long_command_client_closed_exits_without_retry_or_kill(clock, running, 
 
 @pytest.mark.parametrize("error", [
     httpx.ReadTimeout("timeout"), httpx.ConnectError("reset"),
-    SandboxError("gateway unavailable"), RuntimeError("request failed"),
-    ValueError("bad data"),
+    SandboxError("gateway unavailable"), CommandUnavailable("watch disconnected"),
 ])
 def test_wait_error_retries_then_returns_result(clock, running, error):
     collection, handle = running
@@ -105,14 +104,14 @@ def test_persistent_failure_is_paced_within_deadline(clock, running):
 
     def wait(_timeout):
         clock.now += 0.1
-        raise RuntimeError("request failed")
+        raise httpx.ReadError("request failed")
 
     handle.wait.side_effect = wait
-    result = collection._run_with_poll("sleep 60", None, None, 3)
+    result = collection._run_with_poll("sleep 60", None, None, 2)
     assert result.status == CommandStatus.TIMED_OUT
-    assert clock.now == pytest.approx(3)
-    assert clock.sleeps == pytest.approx([1, 1, 0.7])
-    assert handle.wait.call_count == 3
+    assert clock.now == pytest.approx(2)
+    assert clock.sleeps == pytest.approx([1, 0.8])
+    assert handle.wait.call_count == 2
     handle.kill.assert_called_once_with()
 
 
@@ -121,7 +120,7 @@ def test_failure_after_deadline_does_not_delay(clock, running):
 
     def wait(_timeout):
         clock.now += 3
-        raise RuntimeError("request failed")
+        raise httpx.ReadError("request failed")
 
     handle.wait.side_effect = wait
     result = collection._run_with_poll("sleep 60", None, None, 3)
@@ -237,3 +236,110 @@ def test_close_during_poll_stops_wait_thread_and_preserves_other_lease(
         client.close()
         other.close()
         registry.close_all()
+
+
+@pytest.mark.parametrize("entry_point", ["wait", "run"])
+@pytest.mark.parametrize("direct", [False, True])
+@pytest.mark.parametrize("http_status,code,state", [
+    (410, "SANDBOX_EXITED", "FATAL"),
+    (409, "SANDBOX_SCHEDULE_FAILED", "SCHEDULE_FAILED"),
+    (503, "SANDBOX_EXITED", "FATAL"),
+])
+def test_terminal_response_stops_polling(monkeypatch, clock, caplog, entry_point,
+                                        direct, http_status, code, state):
+    requests = []
+    body = {"code": code, "state": state, "retryable": False,
+            "message": "sandbox workload exited", "instance_id": "sandbox",
+            "exit_code": 137, "exit_type": 1, "err_code": 1501}
+
+    def handle(request):
+        requests.append(request)
+        if entry_point == "run" and len(requests) == 1:
+            payload = {"pid": 42}
+            return httpx.Response(200, json=payload if direct else {"code": 200, "data": payload})
+        return httpx.Response(http_status, json=body)
+
+    registry = _http_pool._SharedHTTPClientRegistry()
+    monkeypatch.setattr(_http_pool, "_SHARED_HTTP_CLIENT_REGISTRY", registry)
+    monkeypatch.setattr(_http_pool, "_new_http_client",
+                        lambda _verify: httpx.Client(transport=httpx.MockTransport(handle)))
+    client = SandboxClient(server="poll.example", token="test")
+    client._direct_enabled = direct
+    collection = Commands(client, "sandbox")
+    collection._capabilities_checked = True
+    try:
+        with pytest.raises(SandboxHTTPError) as raised:
+            if entry_point == "wait":
+                CommandHandle("cmd-42", client, "sandbox").wait(timeout=7200)
+            else:
+                collection.run("sleep 60", timeout=7200)
+        assert raised.value.terminal
+        assert raised.value.payload == body
+        assert raised.value.status_code == http_status
+        assert len(requests) == (2 if entry_point == "run" else 1)
+        assert all(request.method == "POST" for request in requests)
+        assert clock.sleeps == []
+        assert raised.value.request_id == requests[-1].headers["X-YR-Request-ID"]
+        assert "command wait failed" not in caplog.text
+    finally:
+        client.close()
+        registry.close_all()
+
+
+def test_recovering_response_retries(clock, running):
+    collection, handle = running
+    error = SandboxHTTPError(503, {
+        "code": "SANDBOX_RECOVERING", "state": "FAILED", "retryable": True,
+    }, "recovering")
+    expected = CommandResult("done", "", 0)
+    handle.wait.side_effect = [error, expected]
+    assert collection._run_with_poll("sleep 60", None, None, 60) is expected
+    assert clock.sleeps == [1]
+    handle.kill.assert_not_called()
+
+
+@pytest.mark.parametrize("error", [
+    httpx.ReadError("reset"), CommandUnavailable("watch disconnected"),
+    SandboxError("gateway unavailable", request_id="request-42"),
+])
+def test_wait_failures_are_bounded(clock, running, error, caplog):
+    collection, handle = running
+    handle.wait.side_effect = error
+    with pytest.raises(CommandUnavailable, match="after 3 consecutive errors") as raised:
+        collection._run_with_poll("sleep 7200", None, None, 7200)
+    assert raised.value.__cause__ is error
+    assert raised.value.sandbox_id == "sandbox"
+    assert raised.value.command_id == "cmd-42"
+    assert raised.value.request_id == getattr(error, "request_id", None)
+    assert handle.wait.call_count == 3
+    assert clock.sleeps == [1, 1]
+    assert caplog.text.count("command wait failed") == 2
+    handle.kill.assert_not_called()
+
+
+def test_normal_wait_timeout_resets_error_budget(clock, running):
+    collection, handle = running
+    error = httpx.ReadError("reset")
+    expected = CommandResult("done", "", 0)
+    handle.wait.side_effect = [error, error, TimeoutError("still running"), error, error, expected]
+    assert collection._run_with_poll("sleep 60", None, None, 60) is expected
+    assert clock.sleeps == [1, 1, 1, 1]
+    handle.kill.assert_not_called()
+
+
+@pytest.mark.parametrize("error", [
+    SandboxHTTPError(401, {}, "unauthorized"),
+    SandboxHTTPError(403, {}, "forbidden"),
+    SandboxHTTPError(400, {}, "bad request"),
+    CommandNotFound("missing command"),
+    RuntimeError("unexpected error"), ValueError("bad data"),
+])
+def test_nonretryable_wait_error_escapes(clock, running, error):
+    collection, handle = running
+    handle.wait.side_effect = error
+    with pytest.raises(type(error)) as raised:
+        collection._run_with_poll("sleep 60", None, None, 60)
+    assert raised.value is error
+    assert handle.wait.call_count == 1
+    assert clock.sleeps == []
+    handle.kill.assert_not_called()
