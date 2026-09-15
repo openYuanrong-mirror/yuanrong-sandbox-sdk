@@ -19,8 +19,10 @@ import random
 import time
 from typing import Dict, List, Optional, Union
 
+import httpx
+
 from ._http_pool import SandboxClientClosedError
-from ._transport import SandboxClient
+from ._transport import SandboxClient, SandboxError, SandboxHTTPError
 from .types import CommandInfo, CommandResult
 
 logger = logging.getLogger(__name__)
@@ -28,6 +30,8 @@ logger = logging.getLogger(__name__)
 _POLL_THRESHOLD = 30  # seconds; above this, switch to start+poll
 _POLL_INTERVAL = 10  # seconds per poll call
 _POLL_RETRY_DELAY = 1  # seconds between failed poll calls
+_POLL_MAX_CONSECUTIVE_ERRORS = 3
+_POLL_NON_RETRYABLE_HTTP_STATUS = frozenset({400, 401, 403, 405, 410, 422})
 
 
 def _poll_pid_until_done(
@@ -35,6 +39,7 @@ def _poll_pid_until_done(
 ) -> CommandResult:
     """Poll a running pid until it finishes or the wall-clock deadline expires."""
     deadline = time.monotonic() + timeout
+    consecutive_errors = 0
     while True:
         remaining = deadline - time.monotonic()
         if remaining <= 0:
@@ -51,14 +56,28 @@ def _poll_pid_until_done(
             )
         except SandboxClientClosedError:
             raise
-        except Exception as e:
-            logger.warning("process.poll failed (pid=%d): %s", pid, e)
+        except (SandboxError, httpx.RequestError) as e:
+            if isinstance(e, SandboxHTTPError) and (
+                e.terminal or e.status_code in _POLL_NON_RETRYABLE_HTTP_STATUS
+            ):
+                raise
+            consecutive_errors += 1
             retry_delay = min(_POLL_RETRY_DELAY, deadline - time.monotonic())
             if retry_delay <= 0:
                 break
+            if consecutive_errors >= _POLL_MAX_CONSECUTIVE_ERRORS:
+                raise SandboxError(
+                    f"process.poll failed (sandbox={sid}, pid={pid}) after "
+                    f"{consecutive_errors} consecutive errors: {e}"
+                ) from e
+            logger.warning(
+                "process.poll failed (sandbox=%s, pid=%d, attempt=%d/%d): %s",
+                sid, pid, consecutive_errors, _POLL_MAX_CONSECUTIVE_ERRORS, e,
+            )
             time.sleep(retry_delay)
             continue
 
+        consecutive_errors = 0
         status = poll["status"]
         if status == "done":
             return CommandResult(
