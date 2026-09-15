@@ -16,6 +16,22 @@ with Sandbox(image="python:3.12-slim", cpu=2000, memory=4096) as sandbox:
 `close()` releases local SDK resources and leaves the remote sandbox alive.
 `kill()` deletes a non-detached remote sandbox as well.
 
+## Command polling failures
+
+`commands.run(timeout=...)` uses polling for commands longer than 30 seconds;
+`CommandHandle.wait(timeout=...)` also polls. A response with
+`code=SANDBOX_EXITED` or `SANDBOX_SCHEDULE_FAILED` and `retryable=false`
+ends polling immediately. The raised `SandboxError` retains the HTTP status
+and structured response (including state, message, and exit details).
+`SANDBOX_RECOVERING` responses with `retryable=true` allow retries.
+
+Transient request failures allow at most three consecutive failed polls, with
+a one-second delay between attempts. A successful poll resets this count.
+Invalid requests and authentication/authorization failures stop immediately.
+On a terminal response or exhausted retry budget, the SDK stops waiting without
+killing the process; the caller retains control of sandbox cleanup. Normal
+command timeout handling still attempts to kill the process.
+
 ## Runtime and scheduling affinities
 
 Fresh creates automatically require the node label `sandbox.runtime` to contain

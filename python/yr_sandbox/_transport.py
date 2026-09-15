@@ -40,6 +40,30 @@ class SandboxError(RuntimeError):
     """Raised when the frontend returns a non-2xx response or an error body."""
 
 
+class SandboxHTTPError(SandboxError):
+    """HTTP failure retaining the server's structured error response."""
+
+    def __init__(self, message: str, status_code: int, body: Optional[Dict[str, Any]] = None):
+        super().__init__(message)
+        self.status_code = status_code
+        self.body = body or {}
+
+    @property
+    def terminal(self) -> bool:
+        return (
+            self.body.get("code") in ("SANDBOX_EXITED", "SANDBOX_SCHEDULE_FAILED")
+            and self.body.get("retryable") is False
+        )
+
+    @classmethod
+    def from_response(cls, resp: httpx.Response, message: str) -> "SandboxHTTPError":
+        try:
+            body = resp.json()
+        except ValueError:
+            body = None
+        return cls(message, resp.status_code, body if isinstance(body, dict) else None)
+
+
 class _RetryableHTTPStatus(SandboxError):
     """Transient gateway response whose create/delete outcome may be unknown."""
 
@@ -703,6 +727,13 @@ class SandboxClient:
                     f"(requestId={request_id}): {exc}"
                 ) from exc
             else:
+                http_error = SandboxHTTPError.from_response(
+                    resp,
+                    f"direct invoke failed: HTTP {resp.status_code} "
+                    f"(requestId={request_id}): {resp.text}",
+                ) if resp.status_code >= 400 else None
+                if http_error is not None and http_error.terminal:
+                    raise http_error
                 if resp.status_code == 404:
                     self._direct_route_misses += 1
                     if (
@@ -722,15 +753,10 @@ class SandboxClient:
                     return {}, True
                 self._direct_route_misses = 0
                 if resp.status_code in _RETRYABLE_GATEWAY_STATUS_CODES:
-                    last_error = _RetryableHTTPStatus(
-                        f"HTTP {resp.status_code}: {resp.text}"
-                    )
+                    last_error = http_error
                     last_failure_safe = False
-                elif resp.status_code >= 400:
-                    raise SandboxError(
-                        f"direct invoke failed: HTTP {resp.status_code} "
-                        f"(requestId={request_id}): {resp.text}"
-                    )
+                elif http_error is not None:
+                    raise http_error
                 else:
                     try:
                         parsed = resp.json()
@@ -767,6 +793,8 @@ class SandboxClient:
             # No connection was established and no request bytes reached RRT.
             self._direct_disabled = True
             return {}, True
+        if isinstance(last_error, SandboxHTTPError):
+            raise last_error
         detail = last_error or "invoke deadline exhausted"
         raise SandboxError(
             "direct invoke outcome is unknown after "
@@ -1134,15 +1162,19 @@ class SandboxClient:
         handles them while preserving the requested local file layout.
         """
         if resp.status_code >= 400:
-            raise SandboxError(f"HTTP {resp.status_code}: {resp.text}")
+            raise SandboxHTTPError.from_response(resp, f"HTTP {resp.status_code}: {resp.text}")
         try:
             envelope = resp.json()
         except ValueError:
             return {}
 
         code = envelope.get("code", resp.status_code)
+        if code in ("SANDBOX_EXITED", "SANDBOX_SCHEDULE_FAILED", "SANDBOX_RECOVERING"):
+            raise SandboxHTTPError(
+                f"{code}: {envelope.get('message', '')}", resp.status_code, envelope
+            )
         if isinstance(code, int) and code >= 400:
-            raise SandboxError(f"code {code}: {envelope.get('message', '')}")
+            raise SandboxHTTPError(f"code {code}: {envelope.get('message', '')}", code, envelope)
 
         raw = envelope.get("data")
         if raw in (None, ""):

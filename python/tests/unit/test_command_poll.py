@@ -9,7 +9,7 @@ import pytest
 
 from yr_sandbox import _http_pool, commands
 from yr_sandbox._http_pool import SandboxClientClosedError
-from yr_sandbox._transport import SandboxClient, SandboxError
+from yr_sandbox._transport import SandboxClient, SandboxError, SandboxHTTPError
 from yr_sandbox.commands import CommandHandle, Commands
 
 
@@ -59,8 +59,6 @@ def test_client_closed_escapes_without_retry_or_kill(clock, entry_point, caplog)
         httpx.ReadTimeout("timeout"),
         httpx.ConnectError("reset"),
         SandboxError("gateway unavailable"),
-        RuntimeError("request failed"),
-        ValueError("bad data"),
     ],
 )
 def test_poll_error_retries_then_returns_output(clock, error):
@@ -84,14 +82,14 @@ def test_persistent_failure_is_paced_and_delay_respects_deadline(clock):
         raise httpx.ReadError("connection reset")
 
     client.invoke.side_effect = invoke
-    result = CommandHandle(42, client, "sandbox").wait(timeout=3)
+    result = CommandHandle(42, client, "sandbox").wait(timeout=2)
 
     assert result.exit_code == -1
-    assert result.stderr == "Command timed out after 3 seconds"
-    assert clock.now == pytest.approx(3)
-    assert clock.sleeps == pytest.approx([1, 1, 0.7])
+    assert result.stderr == "Command timed out after 2 seconds"
+    assert clock.now == pytest.approx(2)
+    assert clock.sleeps == pytest.approx([1, 0.8])
     assert [call.args[1] for call in client.invoke.call_args_list] == [
-        "process.poll", "process.poll", "process.poll", "process.kill"
+        "process.poll", "process.poll", "process.kill"
     ]
 
 
@@ -122,6 +120,126 @@ def test_remote_process_error_returns_failure_without_retry(clock):
     assert result.stderr == "No process with pid 42"
     assert client.invoke.call_count == 1
     assert clock.sleeps == []
+
+
+@pytest.mark.parametrize("entry_point", ["wait", "run"])
+@pytest.mark.parametrize("direct", [False, True])
+@pytest.mark.parametrize("http_status,code,state", [
+    (410, "SANDBOX_EXITED", "FATAL"),
+    (409, "SANDBOX_SCHEDULE_FAILED", "SCHEDULE_FAILED"),
+    (503, "SANDBOX_EXITED", "FATAL"),
+])
+def test_terminal_response_stops_polling(monkeypatch, clock, caplog, entry_point,
+                                        direct, http_status, code, state):
+    requests = []
+    body = {"code": code, "state": state, "retryable": False,
+            "message": "sandbox workload exited", "instance_id": "sandbox",
+            "exit_code": 137, "exit_type": 1, "err_code": 1501}
+
+    def handle(request):
+        requests.append(request)
+        if entry_point == "run" and len(requests) == 1:
+            payload = {"pid": 42}
+            return httpx.Response(200, json=payload if direct else {"code": 200, "data": payload})
+        return httpx.Response(http_status, json=body)
+
+    registry = _http_pool._SharedHTTPClientRegistry()
+    monkeypatch.setattr(_http_pool, "_SHARED_HTTP_CLIENT_REGISTRY", registry)
+    monkeypatch.setattr(_http_pool, "_new_http_client",
+                        lambda _verify: httpx.Client(transport=httpx.MockTransport(handle)))
+    client = SandboxClient(server="poll.example", token="test")
+    client._direct_enabled = direct
+    try:
+        with pytest.raises(SandboxHTTPError) as raised:
+            if entry_point == "wait":
+                CommandHandle(42, client, "sandbox").wait(timeout=7200)
+            else:
+                Commands(client, "sandbox").run("sleep 60", timeout=7200)
+        assert raised.value.terminal
+        assert raised.value.body == body
+        assert raised.value.status_code == http_status
+        assert len(requests) == (2 if entry_point == "run" else 1)
+        assert all(request.method == "POST" for request in requests)
+        assert clock.sleeps == []
+        assert "process.poll failed" not in caplog.text
+    finally:
+        client.close()
+        registry.close_all()
+
+
+def test_recovering_response_can_retry_then_succeed(clock):
+    client = Mock(spec=SandboxClient)
+    body = {"code": "SANDBOX_RECOVERING", "state": "FAILED", "retryable": True}
+    with pytest.raises(SandboxHTTPError) as raised:
+        SandboxClient._json(httpx.Response(503, json=body))
+    error = raised.value
+    assert not error.terminal
+    client.invoke.side_effect = [error, DONE]
+
+    assert CommandHandle(42, client, "sandbox").wait(timeout=60).stdout == "output"
+    assert clock.sleeps == [1]
+    client.instance_info.assert_not_called()
+
+
+def test_consecutive_failures_are_bounded(clock, caplog):
+    client = Mock(spec=SandboxClient)
+    error = httpx.ReadError("connection reset")
+    client.invoke.side_effect = error
+
+    with pytest.raises(SandboxError, match="after 3 consecutive errors") as raised:
+        CommandHandle(42, client, "sandbox").wait(timeout=7200)
+
+    assert raised.value.__cause__ is error
+    assert [call.args[1] for call in client.invoke.call_args_list] == ["process.poll"] * 3
+    client.instance_info.assert_not_called()
+    assert clock.sleeps == [1, 1]
+    assert caplog.text.count("process.poll failed") == 2
+
+
+def test_successful_poll_resets_consecutive_error_budget(clock):
+    client = Mock(spec=SandboxClient)
+    error = httpx.ReadError("reset")
+    client.invoke.side_effect = [error, error, {"status": "running"}, error, error, DONE]
+
+    assert CommandHandle(42, client, "sandbox").wait(timeout=60).stdout == "output"
+    assert clock.sleeps == [1] * 4
+
+
+@pytest.mark.parametrize("error", [
+    ValueError("bad data"), RuntimeError("unexpected failure"),
+    SandboxHTTPError("HTTP 401", 401), SandboxHTTPError("HTTP 403", 403),
+    SandboxHTTPError("HTTP 400", 400),
+])
+def test_nonretryable_error_escapes_without_retry(clock, error):
+    client = Mock(spec=SandboxClient)
+    client.invoke.side_effect = error
+
+    with pytest.raises(type(error)) as raised:
+        CommandHandle(42, client, "sandbox").wait(timeout=60)
+
+    assert raised.value is error
+    assert client.invoke.call_count == 1
+    client.instance_info.assert_not_called()
+    assert clock.sleeps == []
+
+
+@pytest.mark.parametrize("http_status,code", [(403, 403), (200, 403)])
+def test_frontend_http_error_retains_status_code(http_status, code):
+    response = httpx.Response(http_status, json={"code": code, "message": "forbidden"})
+    with pytest.raises(SandboxHTTPError) as raised:
+        SandboxClient._json(response)
+    assert raised.value.status_code == 403
+
+
+@pytest.mark.parametrize("body", [
+    {"message": "fatal error in gateway"},
+    {"code": "SANDBOX_RECOVERING", "retryable": True},
+    {"code": "SANDBOX_EXITED", "retryable": "false"},
+    {"code": "SANDBOX_EXITED"},
+])
+def test_generic_response_does_not_establish_terminal_state(body):
+    error = SandboxHTTPError.from_response(httpx.Response(503, json=body), "unavailable")
+    assert not error.terminal
 
 
 @pytest.mark.parametrize("direct", [False, True])
