@@ -2,6 +2,7 @@
 
 Demonstrates core Sandbox features: command execution, filesystem operations,
 background processes, and lifecycle management.
+The context manager explicitly cleans up the sandbox when the block exits.
 
 Prerequisites:
   - YR_SERVER_ADDRESS and YR_TOKEN environment variables must be set.

@@ -1078,7 +1078,17 @@ class Sandbox:
         try:
             if delete_remote and not self._detached:
                 self._client.delete(self._sid)
-        finally:
+        except BaseException:
+            try:
+                self._client.close()
+            except Exception:
+                logger.warning(
+                    "Failed to close sandbox %s client after deletion failure",
+                    self._sid,
+                    exc_info=True,
+                )
+            raise
+        else:
             self._client.close()
 
     def close(self) -> None:
@@ -1091,7 +1101,13 @@ class Sandbox:
         self._close(delete_remote=False)
 
     def kill(self) -> None:
-        """Release local clients and delete a non-detached remote sandbox."""
+        """Release local clients and delete a non-detached remote sandbox.
+
+        Call explicitly or use a context manager; garbage collection does not
+        clean up sandboxes. Deletion failures propagate after attempting local
+        client cleanup. The handle is closed even on failure; use
+        :meth:`delete` with its ID and connection to retry remote deletion.
+        """
 
         self._close(delete_remote=True)
 
@@ -1102,6 +1118,12 @@ class Sandbox:
         *,
         connection: Optional[ConnectionConfig] = None,
     ) -> None:
+        """Delete a remote sandbox by ID using a temporary client.
+
+        Deletion errors propagate, including when closing the temporary client
+        also fails. This can retry deletion after the original handle closes.
+        Use the original ConnectionConfig, or omit it for environment settings.
+        """
         if connection is not None and not isinstance(connection, ConnectionConfig):
             raise TypeError("connection must be a ConnectionConfig or None")
         if connection is None:
@@ -1110,17 +1132,36 @@ class Sandbox:
             client = SandboxClient(connection=connection)
         try:
             client.delete(sandbox_id)
-        finally:
+        except BaseException:
+            try:
+                client.close()
+            except Exception:
+                logger.warning(
+                    "Failed to close sandbox %s client after deletion failure",
+                    sandbox_id,
+                    exc_info=True,
+                )
+            raise
+        else:
             client.close()
 
     def __enter__(self):
         return self
 
-    def __exit__(self, *exc):
-        self.kill()
-
-    def __del__(self):
+    def __exit__(
+        self,
+        exc_type: object,
+        exc_value: BaseException | None,
+        traceback: object,
+    ) -> None:
+        """Clean up synchronously, preserving an exception from the block."""
         try:
             self.kill()
         except Exception:
-            pass
+            if exc_value is None:
+                raise
+            logger.warning(
+                "Failed to clean up sandbox %s while leaving an exceptional block",
+                self._sid,
+                exc_info=True,
+            )

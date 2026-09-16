@@ -16,6 +16,45 @@ with Sandbox(image="python:3.12-slim", cpu=2000, memory=4096) as sandbox:
 `close()` releases local SDK resources and leaves the remote sandbox alive.
 `kill()` deletes a non-detached remote sandbox as well.
 
+## Explicit lifecycle and cleanup
+
+Use `with Sandbox(...)` to synchronously clean up when the block exits. Without
+a context manager, call `kill()` in a `finally` block:
+
+```python
+sandbox = Sandbox(image="python:3.12-slim", cpu=2000, memory=4096)
+try:
+    print(sandbox.commands.run("echo hello").stdout)
+finally:
+    sandbox.kill()
+```
+
+The SDK does not run per-sandbox cleanup on Python object garbage collection
+or interpreter exit. Applications that previously relied on object destruction
+must migrate to explicit cleanup. Process-wide HTTP pools are still closed at
+interpreter exit.
+
+`kill()` and `close()` retire the local handle and are idempotent. A deletion
+failure is raised to the caller, and local client cleanup is still attempted.
+If the client close also fails, the deletion error is preserved and the close
+error is logged. To retry an unconfirmed remote deletion after the handle has
+closed, use `Sandbox.delete(sandbox.id, connection=connection)` with the same
+`ConnectionConfig`, or omit `connection` to use the configured environment.
+Class-level `delete()` also raises deletion errors. On context exit, errors
+raised by `kill()` propagate when the block succeeded; if the block already
+raised an exception, the cleanup error is logged and the original exception is
+preserved. Tunnel, shell and PTY cleanup remain best-effort so their failures
+do not prevent the remote deletion attempt.
+
+For `detached=True`, `kill()` and context exit only release local resources.
+Call `Sandbox.delete(sandbox.id)` to delete the remote sandbox explicitly,
+passing its `connection` when environment configuration is not used.
+
+The server's configured `idle_timeout` is a fallback for abandoned sandboxes
+that become idle. It is not a maximum lifetime: activity can postpone idle
+reclamation, and a disabled idle timeout provides no such fallback. Explicit
+cleanup is required for deterministic resource release.
+
 ## Image startup process
 
 Set `inherit_entrypoint=True` on a fresh image-backed sandbox to start the
