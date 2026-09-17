@@ -1491,7 +1491,8 @@ def test_reverse_tunnel_url_uses_gateway_tunnel_alias():
             return original_client._safe_id(sandbox_id)
 
     class FakeTunnelClient:
-        def __init__(self, upstream, token=None):
+        def __init__(self, upstream, token=None, sandbox_id=None):
+            seen["sandbox_id"] = sandbox_id
             seen["upstream"] = upstream
             seen["token"] = token
 
@@ -1539,6 +1540,7 @@ def test_reverse_tunnel_url_uses_gateway_tunnel_alias():
         and "RRT_TUNNEL_HTTP_PORT" not in seen["create_env"],
         f"SDK must not set RRT tunnel envs, got {seen['create_env']}",
     )
+    _check(seen["sandbox_id"] == "sandbox-demo", "tunnel must receive created sandbox identity")
     print("ok: reverse tunnel URL uses gateway alias and hides control port ->", seen["url"])
 
 
@@ -1583,7 +1585,8 @@ def test_reverse_tunnel_uses_frontend_returned_tunnel_metadata():
             return original_client._safe_id(sandbox_id)
 
     class FakeTunnelClient:
-        def __init__(self, upstream, token=None):
+        def __init__(self, upstream, token=None, sandbox_id=None):
+            seen["sandbox_id"] = sandbox_id
             seen["token"] = token
 
         def start(self, url, timeout=60):
@@ -1620,6 +1623,7 @@ def test_reverse_tunnel_uses_frontend_returned_tunnel_metadata():
         f"declarative tunnel mismatch: {seen['create_tunnel']}",
     )
     _check(seen["token"] is None, "plaintext tunnel should not carry token")
+    _check(seen["sandbox_id"] == "sandbox-demo", "tunnel identity must come from sandbox, not URL")
     print("ok: reverse tunnel uses frontend-returned metadata")
 
 

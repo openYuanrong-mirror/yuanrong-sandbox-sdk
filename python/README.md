@@ -532,3 +532,17 @@ this count and continues waiting within the command execution deadline.
 Invalid requests, authorization failures and missing command records stop the
 wait. On terminal rejection or exhausted retries, cleanup remains with the
 caller; normal execution deadline handling still attempts to kill the command.
+
+### Tunnel sandbox identity
+
+`Sandbox(upstream=...)` sends its raw sandbox ID as `X-Sandbox-ID` in every
+reverse-tunnel WebSocket handshake, including reconnects. RRT checks it against
+its current logical instance ID before accepting or replacing a tunnel client.
+A mismatch (or an empty/malformed supplied ID) rejects the handshake with HTTP
+409; no tunnel requests are delivered to that client. Snapshot restore updates
+the expected identity to the clone's ID.
+
+Older clients that omit the header remain supported without identity checking.
+Older RRT versions ignore the header; both peers must be upgraded for checking.
+Direct `TunnelClient` users can pass `sandbox_id=...` to enable the same check.
+This check supplements the existing authentication and routing checks.

@@ -672,7 +672,9 @@ class Sandbox:
                 # Only carry the JWT over a TLS tunnel. Plaintext mode is for
                 # auth-disabled local/dev frontends.
                 tunnel_token = self._client.token if tls else None
-                self._tunnel_client = TunnelClient(upstream, token=tunnel_token)
+                self._tunnel_client = TunnelClient(
+                    upstream, token=tunnel_token, sandbox_id=self._sid
+                )
                 logger.info(
                     "Starting TunnelClient: sandbox_id=%s name=%s url=%s "
                     "timeout=%.1fs",

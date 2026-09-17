@@ -328,7 +328,7 @@ class LifecycleTests(unittest.TestCase):
                 return sandbox_id
 
         class Tunnel:
-            def __init__(self, _target, token=None):
+            def __init__(self, _target, token=None, sandbox_id=None):
                 self.token = token
 
             def start(self, _url, timeout=60):
@@ -379,8 +379,9 @@ class LifecycleTests(unittest.TestCase):
                 return sandbox_id
 
         class Tunnel:
-            def __init__(self, _target, token=None):
+            def __init__(self, _target, token=None, sandbox_id=None):
                 seen["token"] = token
+                seen["sandbox_id"] = sandbox_id
 
             def start(self, url, timeout=60):
                 seen["url"] = url
@@ -410,6 +411,7 @@ class LifecycleTests(unittest.TestCase):
 
         self.assertEqual(seen["url"], "wss://gateway.example:8443/tunnel/sandbox-1")
         self.assertEqual(seen["token"], "secret")
+        self.assertEqual(seen["sandbox_id"], "sandbox-1")
 
     def test_update_network_policy_replaces_and_clears_policy(self):
         class Client(_CloseTracker):

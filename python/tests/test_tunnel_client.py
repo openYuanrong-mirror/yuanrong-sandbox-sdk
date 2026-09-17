@@ -1062,6 +1062,36 @@ class TunnelClientTlsTests(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(reconnect_logs)
         self.assertTrue(all(record.levelno < logging.WARNING for record in reconnect_logs))
 
+    async def test_sandbox_identity_is_sent_on_every_handshake(self):
+        client = TunnelClient(upstream="127.0.0.1:1", sandbox_id="raw.id@tenant/sandbox")
+        captured = []
+
+        class RejectedConnection:
+            async def __aenter__(self):
+                if len(captured) == 2:
+                    client._stopping.set()
+                raise OSError("injected disconnect")
+
+            async def __aexit__(self, *_args):
+                return False
+
+        def connect(_url, **kwargs):
+            captured.append(kwargs["additional_headers"])
+            return RejectedConnection()
+
+        with (
+            mock.patch.object(tunnel_client.ws_client, "connect", side_effect=connect),
+            mock.patch.object(tunnel_client.asyncio, "sleep", new=mock.AsyncMock()),
+        ):
+            await client._connect_loop("ws://router.test/tunnel/sanitized-id")
+        self.assertEqual(captured, [{"X-Sandbox-ID": "raw.id@tenant/sandbox"}] * 2)
+        self.assertFalse(client._connected.is_set())
+
+    async def test_invalid_explicit_sandbox_identity_is_rejected(self):
+        for identity in ("", 0, False):
+            with self.subTest(identity=identity), self.assertRaises(ValueError):
+                TunnelClient(upstream="127.0.0.1:1", sandbox_id=identity)
+
     async def test_wss_preserves_legacy_auth_and_default_tls_verification(self):
         client = TunnelClient(upstream="127.0.0.1:1", token="sandbox-token")
         captured = {}
