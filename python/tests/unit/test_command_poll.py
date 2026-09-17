@@ -6,11 +6,16 @@ from unittest.mock import Mock
 
 import httpx
 import pytest
-
 from yr_sandbox import _http_pool, commands
 from yr_sandbox._http_pool import SandboxClientClosedError
 from yr_sandbox._transport import SandboxClient, SandboxError, SandboxHTTPError
-from yr_sandbox.commands import CommandHandle, Commands, CommandUnavailable, CommandNotFound
+from yr_sandbox.commands import (
+    CommandHandle,
+    CommandNotFound,
+    Commands,
+    CommandUnavailable,
+    UnsupportedFeature,
+)
 from yr_sandbox.types import CommandResult, CommandStatus
 
 
@@ -36,7 +41,7 @@ def test_background_execution_deadline_is_explicit(options, expected_timeout):
     client = Mock(spec=SandboxClient)
     client.invoke.side_effect = [
         {"protocol_version": 1, "capabilities": [
-            "stable-command-id", "recoverable-command-result", "multiplexed-command-watch",
+            "stable-command-id", "recoverable-command-result",
         ]},
         {"pid": 42},
     ]
@@ -111,6 +116,118 @@ def test_wait_timeout_remains_retryable(as_http_error):
     assert raised.value.sandbox_id == "sandbox"
     assert raised.value.command_id == "cmd-42"
     assert raised.value.timeout == 15
+
+
+@pytest.mark.parametrize(
+    "capability_response",
+    [
+        {},
+        SandboxHTTPError(400, {"error": "unknown action"}, "unknown action"),
+    ],
+)
+def test_background_command_falls_back_to_legacy_pid_protocol(capability_response):
+    client = Mock(spec=SandboxClient)
+    client.invoke.side_effect = [
+        capability_response,
+        {"pid": 42},
+        {"status": "done", "stdout": "done", "stderr": "", "exit_code": 0},
+    ]
+
+    handle = Commands(client, "sandbox").run("echo done", background=True)
+    result = handle.wait(timeout=15)
+
+    assert result.status == CommandStatus.SUCCEEDED
+    assert result.stdout == "done"
+    assert [call.args[1] for call in client.invoke.call_args_list] == [
+        "process.capabilities",
+        "process.start",
+        "process.poll",
+    ]
+    start = client.invoke.call_args_list[1]
+    assert start.args[2] == {
+        "cmd": "echo done",
+        "envs": None,
+        "cwd": None,
+        "want_stdin": False,
+    }
+    wait = client.invoke.call_args_list[2]
+    assert wait.args[2] == {"pid": 42, "wait_timeout": 15}
+
+
+def test_long_foreground_command_falls_back_to_legacy_pid_protocol():
+    client = Mock(spec=SandboxClient)
+    client.invoke.side_effect = [
+        {},
+        {"pid": 42},
+        {"status": "running"},
+        {"status": "done", "stdout": "done", "stderr": "", "exit_code": 0},
+    ]
+
+    result = Commands(client, "sandbox").run("sleep 31", timeout=31)
+
+    assert result.status == CommandStatus.SUCCEEDED
+    assert [call.args[1] for call in client.invoke.call_args_list] == [
+        "process.capabilities",
+        "process.start",
+        "process.poll",
+        "process.poll",
+    ]
+    assert "timeout" not in client.invoke.call_args_list[1].args[2]
+
+
+def test_legacy_handle_uses_pid_for_wait_kill_and_stdin():
+    client = Mock(spec=SandboxClient)
+    client.invoke.side_effect = [
+        {},
+        {"pid": 42},
+        {"stdout": "done", "stderr": "", "exit_code": 0},
+        {"killed": True},
+        {},
+    ]
+
+    handle = Commands(client, "sandbox").run("cat", background=True, stdin=True)
+
+    assert handle.wait().status == CommandStatus.SUCCEEDED
+    assert handle.kill()
+    handle.send_stdin("input", eof=True)
+    assert [call.args[1] for call in client.invoke.call_args_list] == [
+        "process.capabilities",
+        "process.start",
+        "process.wait",
+        "process.kill",
+        "process.send_stdin",
+    ]
+    assert client.invoke.call_args_list[2].args[2] == {"pid": 42, "timeout": None}
+    assert client.invoke.call_args_list[3].args[2] == {"pid": 42}
+    assert client.invoke.call_args_list[4].args[2] == {
+        "pid": 42,
+        "data": "input",
+        "eof": True,
+    }
+
+
+def test_explicit_command_id_requires_recoverable_protocol():
+    client = Mock(spec=SandboxClient)
+    client.invoke.return_value = {}
+
+    with pytest.raises(UnsupportedFeature, match="recovery protocol v1"):
+        Commands(client, "sandbox").run(
+            "true", background=True, command_id="stable-id"
+        )
+
+    client.invoke.assert_called_once_with("sandbox", "process.capabilities", {})
+
+
+def test_capability_transport_failure_does_not_downgrade_protocol():
+    client = Mock(spec=SandboxClient)
+    error = SandboxHTTPError(503, {"error": "unavailable"}, "unavailable")
+    client.invoke.side_effect = error
+
+    with pytest.raises(UnsupportedFeature, match="failed to negotiate") as raised:
+        Commands(client, "sandbox").run("true", background=True)
+
+    assert raised.value.__cause__ is error
+    client.invoke.assert_called_once_with("sandbox", "process.capabilities", {})
 
 
 @pytest.fixture

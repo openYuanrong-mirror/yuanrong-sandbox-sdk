@@ -1,7 +1,7 @@
-"""Recoverable command execution for sandbox v1.
+"""Command execution for legacy pid and recoverable command protocols.
 
-The public identity is ``command_id``.  A pid is exposed for diagnostics only
-and is never required to recover a handle after the SDK process restarts.
+Runtimes that advertise recovery protocol v1 use stable ``command_id`` values.
+Older runtimes keep their pid-based start, poll, wait, kill, and stdin contract.
 """
 
 import asyncio
@@ -11,13 +11,13 @@ import re
 import time
 import uuid
 from datetime import datetime, timezone
-from typing import Dict, List, Optional, Union
+from typing import Any, Dict, List, Optional, Union
 
 import httpx
 
+from ._command_metrics import increment, observe_wait
 from ._http_pool import SandboxClientClosedError
 from ._transport import SandboxClient, SandboxError, SandboxHTTPError
-from ._command_metrics import increment, observe_wait
 from .types import CommandInfo, CommandResult, CommandStatus
 
 logger = logging.getLogger(__name__)
@@ -27,6 +27,7 @@ _POLL_INTERVAL = 10
 _POLL_RETRY_DELAY = 1  # seconds between failed wait calls
 _POLL_MAX_CONSECUTIVE_ERRORS = 3
 _POLL_NON_RETRYABLE_HTTP_STATUS = frozenset({400, 401, 403, 405, 410, 422})
+_UNSUPPORTED_RECOVERY_HTTP_STATUS = frozenset({400, 405, 501})
 _COMMAND_ID = re.compile(r"^[A-Za-z0-9._:-]{1,128}$")
 
 
@@ -151,6 +152,24 @@ def _is_wait_timeout(snapshot: dict) -> bool:
     )
 
 
+def _legacy_snapshot(snapshot: dict, pid: int, command_id: str) -> dict:
+    """Normalize the pid-based command protocol used before recoverable v1."""
+    normalized = dict(snapshot)
+    status = str(normalized.get("status", "")).upper()
+    if status in ("DONE", "FINISHED"):
+        status = "SUCCEEDED" if int(normalized.get("exit_code", 0)) == 0 else "FAILED"
+    elif status == "ERROR":
+        status = "FAILED"
+        normalized.setdefault("stderr", normalized.get("error", "Unknown error"))
+        normalized.setdefault("exit_code", -1)
+    elif status == "":
+        status = "SUCCEEDED" if int(normalized.get("exit_code", -1)) == 0 else "FAILED"
+    normalized["status"] = status
+    normalized.setdefault("pid", pid)
+    normalized.setdefault("command_id", command_id)
+    return normalized
+
+
 def _result(snapshot: dict) -> CommandResult:
     raw_status = snapshot.get("status")
     if raw_status is None:
@@ -201,7 +220,7 @@ def _info(snapshot: dict) -> CommandInfo:
 
 
 class CommandHandle:
-    """A recoverable reference to one command in one sandbox."""
+    """A reference to one command using its negotiated runtime protocol."""
 
     def __init__(
         self,
@@ -209,11 +228,14 @@ class CommandHandle:
         client: SandboxClient,
         sandbox_id: str,
         pid: int = 0,
+        *,
+        recoverable: bool = True,
     ):
         self.command_id = _validate_command_id(command_id)
         self.pid = pid
         self._client = client
         self._sid = sandbox_id
+        self._recoverable = recoverable
 
     @property
     def id(self) -> str:
@@ -227,6 +249,13 @@ class CommandHandle:
         return _info(self._raw_snapshot())
 
     def _raw_snapshot(self) -> dict:
+        if not self._recoverable:
+            snapshot = self._client.invoke(
+                self._sid,
+                "process.poll",
+                {"pid": self.pid, "wait_timeout": 0},
+            )
+            return _legacy_snapshot(snapshot, self.pid, self.command_id)
         try:
             snapshot = self._client.invoke(
                 self._sid, "process.get", {"command_id": self.command_id}
@@ -261,6 +290,23 @@ class CommandHandle:
         increment("command_wait_total")
         started = time.monotonic()
         try:
+            if not self._recoverable:
+                action = "process.wait" if timeout is None else "process.poll"
+                args = (
+                    {"pid": self.pid, "timeout": None}
+                    if timeout is None
+                    else {"pid": self.pid, "wait_timeout": timeout}
+                )
+                snapshot = self._client.invoke(
+                    self._sid,
+                    action,
+                    args,
+                    timeout=-1 if timeout is None else max(1, int(timeout) + 1),
+                )
+                snapshot = _legacy_snapshot(snapshot, self.pid, self.command_id)
+                if snapshot["status"] == "RUNNING":
+                    raise CommandWaitTimeout(self._sid, self.command_id, timeout)
+                return _result(snapshot)
             snapshot = self._raw_snapshot()
             if str(snapshot.get("status", "")).upper() in ("PENDING", "RUNNING"):
                 try:
@@ -291,17 +337,25 @@ class CommandHandle:
         return await asyncio.to_thread(self.wait, timeout)
 
     def kill(self) -> bool:
+        key = (
+            {"command_id": self.command_id}
+            if self._recoverable
+            else {"pid": self.pid}
+        )
         return bool(
-            self._client.invoke(
-                self._sid, "process.kill", {"command_id": self.command_id}
-            )["killed"]
+            self._client.invoke(self._sid, "process.kill", key)["killed"]
         )
 
     def send_stdin(self, data: str, eof: bool = False) -> None:
+        key = (
+            {"command_id": self.command_id}
+            if self._recoverable
+            else {"pid": self.pid}
+        )
         response = self._client.invoke(
             self._sid,
             "process.send_stdin",
-            {"command_id": self.command_id, "data": data, "eof": eof},
+            {**key, "data": data, "eof": eof},
         )
         if response.get("error"):
             raise RuntimeError(f"Failed to send stdin: {response['error']}")
@@ -318,29 +372,45 @@ class Commands:
         self._sid = sandbox_id
         self._default_cwd = default_cwd
         self._capabilities_checked = False
+        self._recovery_supported = True
 
-    def _require_recovery_capability(self, command_id: str = "") -> None:
+    def _supports_recovery(self) -> bool:
         if self._capabilities_checked:
-            return
+            return self._recovery_supported
         try:
             response = self._client.invoke(self._sid, "process.capabilities", {})
+        except SandboxHTTPError as error:
+            if error.terminal:
+                raise
+            if error.status_code not in _UNSUPPORTED_RECOVERY_HTTP_STATUS:
+                raise UnsupportedFeature(
+                    "failed to negotiate the recoverable command capability",
+                    sandbox_id=self._sid,
+                    request_id=error.request_id,
+                ) from error
+            response = {}
         except Exception as error:
             raise UnsupportedFeature(
-                "sandbox runtime does not expose the recoverable command capability",
+                "failed to negotiate the recoverable command capability",
                 sandbox_id=self._sid,
-                command_id=command_id,
                 request_id=getattr(error, "request_id", None),
             ) from error
         capabilities = set(response.get("capabilities", ()))
         required = {"stable-command-id", "recoverable-command-result"}
-        if response.get("protocol_version") != 1 or not required.issubset(capabilities):
+        self._recovery_supported = (
+            response.get("protocol_version") == 1
+            and required.issubset(capabilities)
+        )
+        self._capabilities_checked = True
+        return self._recovery_supported
+
+    def _require_recovery_capability(self, command_id: str = "") -> None:
+        if not self._supports_recovery():
             raise UnsupportedFeature(
                 "sandbox runtime does not support command recovery protocol v1",
                 sandbox_id=self._sid,
                 command_id=command_id,
-                request_id=getattr(response, "request_id", None),
             )
-        self._capabilities_checked = True
 
     def run(
         self,
@@ -364,16 +434,27 @@ class Commands:
         if background:
             increment("command_submit_total")
             stable_id = _validate_command_id(command_id or f"cmd-{uuid.uuid4()}")
-            self._require_recovery_capability(stable_id)
-            request = {
-                "command_id": stable_id,
-                "command": cmd,
-                "envs": envs,
-                "cwd": effective_cwd,
-                "want_stdin": stdin,
-            }
-            if timeout is not None:
-                request["timeout"] = timeout
+            recoverable = self._supports_recovery()
+            if command_id is not None and not recoverable:
+                self._require_recovery_capability(stable_id)
+            request: Dict[str, Any]
+            if recoverable:
+                request = {
+                    "command_id": stable_id,
+                    "command": cmd,
+                    "envs": envs,
+                    "cwd": effective_cwd,
+                    "want_stdin": stdin,
+                }
+                if timeout is not None:
+                    request["timeout"] = timeout
+            else:
+                request = {
+                    "cmd": cmd,
+                    "envs": envs,
+                    "cwd": effective_cwd,
+                    "want_stdin": stdin,
+                }
             try:
                 response = self._client.invoke(self._sid, "process.start", request)
             except SandboxHTTPError as error:
@@ -424,7 +505,13 @@ class Commands:
                         request_id=getattr(response, "request_id", None),
                     )
                 raise RuntimeError(f"Failed to start command: {response['error']}")
-            return CommandHandle(stable_id, self._client, self._sid, int(response.get("pid", 0)))
+            return CommandHandle(
+                stable_id,
+                self._client,
+                self._sid,
+                int(response.get("pid", 0)),
+                recoverable=recoverable,
+            )
 
         timeout = 60 if timeout is None else timeout
         if timeout > _POLL_THRESHOLD:
