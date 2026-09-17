@@ -144,6 +144,13 @@ def _validate_command_id(command_id: str) -> str:
     return command_id
 
 
+def _is_wait_timeout(snapshot: dict) -> bool:
+    return (
+        snapshot.get("error_code") == "WAIT_TIMEOUT"
+        and str(snapshot.get("status", "")).upper() in ("PENDING", "RUNNING")
+    )
+
+
 def _result(snapshot: dict) -> CommandResult:
     raw_status = snapshot.get("status")
     if raw_status is None:
@@ -256,19 +263,21 @@ class CommandHandle:
         try:
             snapshot = self._raw_snapshot()
             if str(snapshot.get("status", "")).upper() in ("PENDING", "RUNNING"):
-                connection = getattr(self._client, "_connection", None)
-                if connection is None:
+                try:
                     snapshot = self._client.invoke(
                         self._sid,
                         "process.wait",
                         {"command_id": self.command_id, "timeout": timeout},
                         timeout=-1 if timeout is None else max(1, int(timeout) + 1),
                     )
-                else:
-                    from ._command_watch import manager_for
-
-                    manager_for(connection).wait(self._sid, self.command_id, timeout)
-                    snapshot = self._raw_snapshot()
+                except SandboxHTTPError as error:
+                    if error.status_code == 400 and _is_wait_timeout(error.payload):
+                        raise CommandWaitTimeout(
+                            self._sid, self.command_id, timeout
+                        ) from error
+                    raise
+                if _is_wait_timeout(snapshot):
+                    raise CommandWaitTimeout(self._sid, self.command_id, timeout)
             return _result(snapshot)
         finally:
             observe_wait(time.monotonic() - started)
@@ -276,27 +285,10 @@ class CommandHandle:
     async def wait_async(self, timeout: Optional[float] = None) -> CommandResult:
         """Wait without blocking the caller's event loop.
 
-        The shared command watch transport can wake this wait; the authoritative
-        terminal result is always fetched through ``process.wait/get``.
+        The authoritative terminal result is fetched through ``process.wait/get``
+        on a worker thread.
         """
-        connection = getattr(self._client, "_connection", None)
-        if connection is None:
-            return await asyncio.to_thread(self.wait, timeout)
-
-        increment("command_wait_total")
-        started = time.monotonic()
-        try:
-            snapshot = await asyncio.to_thread(self._raw_snapshot)
-            if str(snapshot.get("status", "")).upper() in ("PENDING", "RUNNING"):
-                from ._command_watch import manager_for
-
-                await manager_for(connection).wait_async(
-                    self._sid, self.command_id, timeout
-                )
-                snapshot = await asyncio.to_thread(self._raw_snapshot)
-            return _result(snapshot)
-        finally:
-            observe_wait(time.monotonic() - started)
+        return await asyncio.to_thread(self.wait, timeout)
 
     def kill(self) -> bool:
         return bool(
@@ -340,7 +332,7 @@ class Commands:
                 request_id=getattr(error, "request_id", None),
             ) from error
         capabilities = set(response.get("capabilities", ()))
-        required = {"stable-command-id", "recoverable-command-result", "multiplexed-command-watch"}
+        required = {"stable-command-id", "recoverable-command-result"}
         if response.get("protocol_version") != 1 or not required.issubset(capabilities):
             raise UnsupportedFeature(
                 "sandbox runtime does not support command recovery protocol v1",

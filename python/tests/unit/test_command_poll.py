@@ -63,6 +63,56 @@ def test_foreground_default_deadline_is_preserved(monkeypatch, options, expected
     poll.assert_called_once_with("sleep 120", None, None, expected_timeout)
 
 
+def test_wait_uses_recoverable_process_wait_with_connection():
+    client = Mock(spec=SandboxClient)
+    client._connection = object()
+    client.invoke.side_effect = [
+        {"command_id": "cmd-42", "pid": 42, "status": "RUNNING"},
+        {
+            "command_id": "cmd-42",
+            "pid": 42,
+            "status": "SUCCEEDED",
+            "stdout": "done",
+            "stderr": "",
+            "exit_code": 0,
+        },
+    ]
+
+    result = CommandHandle("cmd-42", client, "sandbox", 42).wait(timeout=15)
+
+    assert result.status == CommandStatus.SUCCEEDED
+    assert result.stdout == "done"
+    assert [call.args[1] for call in client.invoke.call_args_list] == [
+        "process.get",
+        "process.wait",
+    ]
+    wait_call = client.invoke.call_args_list[1]
+    assert wait_call.args[2] == {"command_id": "cmd-42", "timeout": 15}
+    assert wait_call.kwargs["timeout"] == 16
+
+
+@pytest.mark.parametrize("as_http_error", [False, True])
+def test_wait_timeout_remains_retryable(as_http_error):
+    client = Mock(spec=SandboxClient)
+    timeout = {
+        "status": "running",
+        "error_code": "WAIT_TIMEOUT",
+        "error": "command wait timed out",
+    }
+    response = SandboxHTTPError(400, timeout, timeout["error"])
+    client.invoke.side_effect = [
+        {"command_id": "cmd-42", "pid": 42, "status": "RUNNING"},
+        response if as_http_error else timeout,
+    ]
+
+    with pytest.raises(commands.CommandWaitTimeout) as raised:
+        CommandHandle("cmd-42", client, "sandbox", 42).wait(timeout=15)
+
+    assert raised.value.sandbox_id == "sandbox"
+    assert raised.value.command_id == "cmd-42"
+    assert raised.value.timeout == 15
+
+
 @pytest.fixture
 def running(monkeypatch):
     handle = Mock(spec=CommandHandle)

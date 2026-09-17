@@ -27,7 +27,6 @@ SDK_CAPABILITIES = frozenset(
         "explicit-connection-config",
         "tunnel-proxy-port",
         "recoverable-commands",
-        "multiplexed-command-watch",
     }
 )
 
