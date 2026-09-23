@@ -152,6 +152,34 @@ def _is_wait_timeout(snapshot: dict) -> bool:
     )
 
 
+def _wait_timeout_result(snapshot: dict) -> CommandResult:
+    timeout_snapshot = dict(snapshot)
+    timeout_snapshot["status"] = "RUNNING"
+    timeout_snapshot["error_code"] = "WAIT_TIMEOUT"
+    timeout_snapshot["error_message"] = str(
+        timeout_snapshot.get("error") or "command wait timed out"
+    )
+    timeout_snapshot.pop("exit_code", None)
+    return _result(timeout_snapshot)
+
+
+def _kill_command(client: SandboxClient, sandbox_id: str, key: dict) -> bool:
+    try:
+        response = client.invoke(sandbox_id, "process.kill", key)
+    except SandboxHTTPError as error:
+        if error.status_code in (400, 404) and error.payload.get("error_code") in (
+            "COMMAND_NOT_FOUND",
+            "COMMAND_NOT_RUNNING",
+        ):
+            return False
+        raise
+    if response.get("error_code") in ("COMMAND_NOT_FOUND", "COMMAND_NOT_RUNNING"):
+        return False
+    if response.get("error"):
+        raise SandboxError(str(response["error"]))
+    return bool(response["killed"])
+
+
 def _legacy_snapshot(snapshot: dict, pid: int, command_id: str) -> dict:
     """Normalize the pid-based command protocol used before recoverable v1."""
     normalized = dict(snapshot)
@@ -287,6 +315,7 @@ class CommandHandle:
         return self._snapshot().status
 
     def wait(self, timeout: Optional[float] = None) -> CommandResult:
+        """Observe completion; a wait deadline returns a RUNNING timeout result."""
         increment("command_wait_total")
         started = time.monotonic()
         try:
@@ -305,7 +334,7 @@ class CommandHandle:
                 )
                 snapshot = _legacy_snapshot(snapshot, self.pid, self.command_id)
                 if snapshot["status"] == "RUNNING":
-                    raise CommandWaitTimeout(self._sid, self.command_id, timeout)
+                    return _wait_timeout_result(snapshot)
                 return _result(snapshot)
             snapshot = self._raw_snapshot()
             if str(snapshot.get("status", "")).upper() in ("PENDING", "RUNNING"):
@@ -318,12 +347,10 @@ class CommandHandle:
                     )
                 except SandboxHTTPError as error:
                     if error.status_code == 400 and _is_wait_timeout(error.payload):
-                        raise CommandWaitTimeout(
-                            self._sid, self.command_id, timeout
-                        ) from error
+                        return _wait_timeout_result(error.payload)
                     raise
                 if _is_wait_timeout(snapshot):
-                    raise CommandWaitTimeout(self._sid, self.command_id, timeout)
+                    return _wait_timeout_result(snapshot)
             return _result(snapshot)
         finally:
             observe_wait(time.monotonic() - started)
@@ -337,14 +364,13 @@ class CommandHandle:
         return await asyncio.to_thread(self.wait, timeout)
 
     def kill(self) -> bool:
+        """Return whether a live command was signalled (False if absent or finished)."""
         key = (
             {"command_id": self.command_id}
             if self._recoverable
             else {"pid": self.pid}
         )
-        return bool(
-            self._client.invoke(self._sid, "process.kill", key)["killed"]
-        )
+        return _kill_command(self._client, self._sid, key)
 
     def send_stdin(self, data: str, eof: bool = False) -> None:
         key = (
@@ -541,12 +567,14 @@ class Commands:
             remaining = deadline - time.monotonic()
             if remaining <= 0:
                 try:
-                    handle.kill()
+                    killed = handle.kill()
                 except SandboxHTTPError as error:
                     if error.status_code != 400 or error.payload.get("error_code") != "COMMAND_NOT_RUNNING":
                         raise
                     # RRT may reach its execution deadline before the local
                     # wait expires. Return that authoritative terminal result.
+                    return handle.wait(0)
+                if not killed:
                     return handle.wait(0)
                 return CommandResult(
                     "",
@@ -556,7 +584,11 @@ class Commands:
                 )
             wait = min(_POLL_INTERVAL * (0.7 + random.random() * 0.6), remaining)
             try:
-                return handle.wait(wait)
+                result = handle.wait(wait)
+                if result.error_code == "WAIT_TIMEOUT" and result.status == CommandStatus.RUNNING:
+                    consecutive_errors = 0
+                    continue
+                return result
             except SandboxClientClosedError:
                 raise
             except TimeoutError:
@@ -600,8 +632,9 @@ class Commands:
         return [_info(item) for item in processes if isinstance(item, dict)]
 
     def kill(self, command: Union[str, int]) -> bool:
+        """Return whether a live command was signalled (False if absent or finished)."""
         key = {"command_id": command} if isinstance(command, str) else {"pid": command}
-        return bool(self._client.invoke(self._sid, "process.kill", key)["killed"])
+        return _kill_command(self._client, self._sid, key)
 
     def send_stdin(self, command: Union[str, int], data: str, eof: bool = False) -> None:
         key = {"command_id": command} if isinstance(command, str) else {"pid": command}

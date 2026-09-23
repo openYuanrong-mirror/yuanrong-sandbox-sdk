@@ -1,5 +1,6 @@
 """Command waits stop on client closure and pace failed requests."""
 
+import asyncio
 import threading
 from types import SimpleNamespace
 from unittest.mock import Mock
@@ -97,7 +98,7 @@ def test_wait_uses_recoverable_process_wait_with_connection():
 
 
 @pytest.mark.parametrize("as_http_error", [False, True])
-def test_wait_timeout_remains_retryable(as_http_error):
+def test_wait_timeout_returns_running_result(as_http_error):
     client = Mock(spec=SandboxClient)
     timeout = {
         "status": "running",
@@ -110,12 +111,47 @@ def test_wait_timeout_remains_retryable(as_http_error):
         response if as_http_error else timeout,
     ]
 
-    with pytest.raises(commands.CommandWaitTimeout) as raised:
-        CommandHandle("cmd-42", client, "sandbox", 42).wait(timeout=15)
+    result = CommandHandle("cmd-42", client, "sandbox", 42).wait(timeout=15)
 
-    assert raised.value.sandbox_id == "sandbox"
-    assert raised.value.command_id == "cmd-42"
-    assert raised.value.timeout == 15
+    assert result.status == CommandStatus.RUNNING
+    assert result.error_code == "WAIT_TIMEOUT"
+    assert result.error_message == "command wait timed out"
+    assert result.exit_code is None
+
+
+def test_wait_async_returns_timeout_then_can_wait_again():
+    client = Mock(spec=SandboxClient)
+    client.invoke.side_effect = [
+        {"command_id": "cmd-42", "status": "RUNNING"},
+        {"status": "running", "error_code": "WAIT_TIMEOUT", "error": "still running"},
+        {"command_id": "cmd-42", "status": "SUCCEEDED", "exit_code": 0},
+    ]
+    handle = CommandHandle("cmd-42", client, "sandbox", 42)
+
+    timeout = asyncio.run(handle.wait_async(timeout=0))
+    completed = handle.wait(timeout=15)
+
+    assert timeout.status == CommandStatus.RUNNING
+    assert timeout.error_code == "WAIT_TIMEOUT"
+    assert timeout.error_message == "still running"
+    assert completed.status == CommandStatus.SUCCEEDED
+    assert completed.exit_code == 0
+
+
+def test_legacy_wait_timeout_returns_running_result():
+    client = Mock(spec=SandboxClient)
+    client.invoke.return_value = {"status": "running"}
+
+    result = CommandHandle(
+        "cmd-42", client, "sandbox", 42, recoverable=False
+    ).wait(timeout=15)
+
+    assert result.status == CommandStatus.RUNNING
+    assert result.error_code == "WAIT_TIMEOUT"
+    assert result.exit_code is None
+    client.invoke.assert_called_once_with(
+        "sandbox", "process.poll", {"pid": 42, "wait_timeout": 15}, timeout=16
+    )
 
 
 @pytest.mark.parametrize(
@@ -204,6 +240,48 @@ def test_legacy_handle_uses_pid_for_wait_kill_and_stdin():
         "data": "input",
         "eof": True,
     }
+
+
+@pytest.mark.parametrize("entry_point", ["handle", "collection"])
+@pytest.mark.parametrize("code,status", [
+    ("COMMAND_NOT_FOUND", 404),
+    ("COMMAND_NOT_RUNNING", 400),
+])
+def test_kill_absent_command_is_successful_noop(entry_point, code, status):
+    client = Mock(spec=SandboxClient)
+    client.invoke.side_effect = SandboxHTTPError(
+        status, {"error_code": code, "killed": False}, code
+    )
+
+    if entry_point == "handle":
+        killed = CommandHandle("cmd-42", client, "sandbox", 42).kill()
+    else:
+        killed = Commands(client, "sandbox").kill("cmd-42")
+
+    assert killed is False
+    client.invoke.assert_called_once_with(
+        "sandbox", "process.kill", {"command_id": "cmd-42"}
+    )
+
+
+def test_kill_signal_failure_still_raises():
+    client = Mock(spec=SandboxClient)
+    client.invoke.return_value = {
+        "killed": False,
+        "error_code": "SIGNAL_FAILED",
+        "error": "permission denied",
+    }
+
+    with pytest.raises(SandboxError, match="permission denied"):
+        Commands(client, "sandbox").kill("cmd-42")
+
+
+@pytest.mark.parametrize("status", ["NOT_FOUND", "ALREADY_EXITED"])
+def test_kill_noop_response_returns_false(status):
+    client = Mock(spec=SandboxClient)
+    client.invoke.return_value = {"status": status, "killed": False, "error": None}
+
+    assert Commands(client, "sandbox").kill("cmd-42") is False
 
 
 def test_explicit_command_id_requires_recoverable_protocol():
@@ -300,7 +378,10 @@ def test_failure_after_deadline_does_not_delay(clock, running):
 def test_wait_timeout_continues_waiting(clock, running):
     collection, handle = running
     expected = CommandResult("done", "", 0)
-    handle.wait.side_effect = [TimeoutError("still running"), expected]
+    timeout = CommandResult(
+        "", "", None, status=CommandStatus.RUNNING, error_code="WAIT_TIMEOUT"
+    )
+    handle.wait.side_effect = [timeout, expected]
     assert collection._run_with_poll("sleep 60", None, None, 60) is expected
     assert clock.sleeps == []
     handle.kill.assert_not_called()
@@ -329,6 +410,26 @@ def test_local_deadline_racing_remote_completion_returns_terminal_result(clock, 
     assert collection._run_with_poll("sleep 3", None, None, 3) is terminal
     handle.kill.assert_called_once_with()
     assert len(waits) == 2
+
+
+def test_local_deadline_returns_terminal_result_after_noop_kill(clock, running):
+    collection, handle = running
+    terminal = CommandResult("done", "", 0, status=CommandStatus.SUCCEEDED)
+
+    def wait(timeout):
+        if timeout:
+            clock.now += 3
+            return CommandResult(
+                "", "", None, status=CommandStatus.RUNNING, error_code="WAIT_TIMEOUT"
+            )
+        return terminal
+
+    handle.wait.side_effect = wait
+    handle.kill.return_value = False
+
+    assert collection._run_with_poll("sleep 3", None, None, 3) is terminal
+    assert handle.wait.call_count == 2
+    handle.kill.assert_called_once_with()
 
 
 @pytest.mark.parametrize("code,payload", [(401, {}), (400, {"error_code": "INVALID_COMMAND_ID"})])
