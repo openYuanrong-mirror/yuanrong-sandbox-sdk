@@ -283,10 +283,17 @@ class SDKContractTests(unittest.TestCase):
                     "labelOps": [
                         {
                             "type": 0,
+                            "labelKey": "sandbox.runtime",
+                            "labelValues": ["runsc"],
+                        },
+                        {
+                            "type": 0,
                             "labelKey": "NODE_ID",
                             "labelValues": ["node-a"],
                         }
                     ],
+                    "preferredPriority": False,
+                    "preferredAntiOtherLabels": False,
                 }
             ],
         )
